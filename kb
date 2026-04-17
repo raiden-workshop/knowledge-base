@@ -1,0 +1,2172 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable
+
+import kb_core
+
+
+REPO_ROOT = Path(__file__).resolve().parent
+WIKI_ROOT = REPO_ROOT / "wiki"
+RAW_ROOT = REPO_ROOT / "raw"
+OUTPUT_ROOT = REPO_ROOT / "output"
+INDEX_PATH = WIKI_ROOT / "index.md"
+LOG_PATH = WIKI_ROOT / "log.md"
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+MEMORY_HOME = CODEX_HOME / "memory"
+MEMORY_INDEX_PATH = MEMORY_HOME / "workspaces" / "index.json"
+REFRESH_SCRIPT = CODEX_HOME / "scripts" / "refresh_memory.py"
+
+PAGE_LAYOUT = {
+    "source": {
+        "dir": WIKI_ROOT / "sources",
+        "prefix": "source-",
+        "index_heading": "## Sources",
+    },
+    "entity": {
+        "dir": WIKI_ROOT / "entities",
+        "prefix": "entity-",
+        "index_heading": "## Entities",
+    },
+    "concept": {
+        "dir": WIKI_ROOT / "concepts",
+        "prefix": "concept-",
+        "index_heading": "## Concepts",
+    },
+    "synthesis": {
+        "dir": WIKI_ROOT / "syntheses",
+        "prefix": "synthesis-",
+        "index_heading": "## Syntheses",
+    },
+    "domain": {
+        "dir": WIKI_ROOT / "domains",
+        "prefix": "domain-",
+        "index_heading": "## Domains",
+    },
+    "report": {
+        "dir": WIKI_ROOT / "reports",
+        "prefix": "report-",
+        "index_heading": "## Reports",
+    },
+}
+
+REQUIRED_FRONTMATTER_KEYS = {"title", "type", "status", "created_at", "updated_at", "source_refs", "related"}
+REQUIRED_CANONICAL_FRONTMATTER_KEYS = REQUIRED_FRONTMATTER_KEYS | {"domain", "industries", "categories"}
+SOURCE_REF_REQUIRED_TYPES = {"source", "entity", "concept", "synthesis"}
+ANSWER_PAGE_TYPES = {"entity", "concept", "synthesis"}
+CANONICAL_TYPES = {"source", "entity", "concept", "synthesis", "domain", "report"}
+CANONICAL_DIRS = {spec["dir"].name for spec in PAGE_LAYOUT.values()}
+FOUNDING_DOMAIN = "codex-native-memory-governance"
+FOUNDING_INDUSTRIES = ["ai"]
+DEFAULT_PAGE_CATEGORIES = {
+    "source": ["reference"],
+    "entity": ["tooling"],
+    "concept": ["architecture"],
+    "synthesis": ["workflow"],
+    "domain": ["governance"],
+    "report": ["maintenance"],
+}
+STABLE_HEADINGS = [
+    "Stable Claims",
+    "Stable Conclusions",
+    "Key Claims",
+    "Practical Meaning",
+    "Summary",
+    "Current Thesis",
+    "Current Judgment",
+    "Recommendation",
+]
+QUERY_KIND_BONUS = {
+    "concept": 8,
+    "synthesis": 7,
+    "entity": 5,
+    "domain": 3,
+    "source": 0,
+    "report": -8,
+}
+QUERY_STATUS_BONUS = {
+    "active": 1,
+    "draft": -2,
+    "archived": -4,
+}
+LOCALE_VARIANT_MARKERS = [
+    "zh-cn",
+    "zh-hans",
+    "zh-hant",
+    "zh",
+    "cn",
+    "chinese",
+    "中文",
+    "中文版",
+    "简体中文",
+    "繁体中文",
+    "简中",
+    "繁中",
+    "en-us",
+    "en-gb",
+    "en-uk",
+    "english",
+    "en",
+    "英文版",
+    "英文",
+    "bilingual",
+    "双语",
+]
+LOCALE_VARIANT_PATTERN = "|".join(re.escape(item) for item in LOCALE_VARIANT_MARKERS)
+TRAILING_LOCALE_PAREN_RE = re.compile(rf"(?:\s*\((?:{LOCALE_VARIANT_PATTERN})\))+$", re.IGNORECASE)
+TRAILING_LOCALE_TOKEN_RE = re.compile(rf"(?:[\s\-_]+(?:{LOCALE_VARIANT_PATTERN}))+$", re.IGNORECASE)
+
+
+@dataclass
+class Page:
+    path: Path
+    meta: dict
+    body: str
+    has_frontmatter: bool
+
+    @property
+    def repo_rel(self) -> str:
+        return self.path.relative_to(REPO_ROOT).as_posix()
+
+
+@dataclass
+class Issue:
+    level: str
+    message: str
+
+
+@dataclass
+class QueryResult:
+    path: Path
+    kind: str
+    title: str
+    match_score: int
+    score: int
+    matched_fields: list[str]
+    snippet: str | None
+    source_refs: list[str]
+    related: list[str]
+    suppressed_duplicates: list[str]
+
+
+@dataclass
+class DriftSignal:
+    level: str
+    category: str
+    page: str
+    message: str
+    related_paths: list[str]
+
+
+def now_local() -> datetime:
+    return datetime.now().astimezone()
+
+
+def today_str() -> str:
+    return now_local().date().isoformat()
+
+
+def timestamp_str() -> str:
+    return now_local().isoformat(timespec="seconds")
+
+
+def parse_timestamp(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for candidate in (text, f"{text}T00:00:00+00:00"):
+        try:
+            parsed = datetime.fromisoformat(candidate)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=now_local().tzinfo)
+            return parsed
+        except ValueError:
+            continue
+    return None
+
+
+def die(message: str, code: int = 1) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def slugify(text: str) -> str:
+    fragment = text.strip().lower()
+    fragment = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "-", fragment)
+    fragment = re.sub(r"-{2,}", "-", fragment).strip("-")
+    return fragment or "item"
+
+
+def normalize_repo_path(path_str: str) -> Path:
+    candidate = Path(path_str)
+    if not candidate.is_absolute():
+        candidate = (REPO_ROOT / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    try:
+        candidate.relative_to(REPO_ROOT)
+    except ValueError as exc:
+        raise ValueError(f"path must stay inside repo: {path_str}") from exc
+    return candidate
+
+
+def ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def load_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def dump_text(path: Path, content: str) -> None:
+    ensure_parent(path)
+    path.write_text(content, encoding="utf-8")
+
+
+def repo_paths() -> kb_core.RepoPaths:
+    return kb_core.build_repo_paths(REPO_ROOT, WIKI_ROOT, RAW_ROOT, OUTPUT_ROOT, PAGE_LAYOUT)
+
+
+def render_page(meta: dict, body: str) -> str:
+    return kb_core.render_page(meta, body)
+
+
+def split_frontmatter(text: str) -> tuple[dict, str, bool]:
+    return kb_core.split_frontmatter(text)
+
+
+def parse_frontmatter(frontmatter: str) -> dict:
+    return kb_core.parse_frontmatter(frontmatter)
+
+
+def parse_scalar(value: str) -> object:
+    return kb_core.parse_scalar(value)
+
+
+def load_page(path: Path) -> Page:
+    return kb_core.load_page(repo_paths(), path)
+
+
+def render_frontmatter(meta: dict) -> str:
+    return kb_core.render_frontmatter(meta)
+
+
+def page_destination(kind: str, slug: str) -> Path:
+    spec = PAGE_LAYOUT[kind]
+    return spec["dir"] / f'{spec["prefix"]}{slug}.md'
+
+
+def normalize_reference_for_page(page_path: Path, ref: str) -> str:
+    return kb_core.normalize_reference_for_page(repo_paths(), page_path, ref)
+
+
+def resolve_repo_reference(page_path: Path, ref: str) -> Path:
+    return kb_core.resolve_repo_reference(page_path, ref)
+
+
+def repo_rel(path: Path) -> str:
+    return kb_core.repo_rel(repo_paths(), path)
+
+
+def wiki_link(path: Path) -> str:
+    return f"./{path.relative_to(WIKI_ROOT).as_posix()}"
+
+
+def canonical_pages() -> list[Path]:
+    return kb_core.canonical_pages(repo_paths())
+
+
+def canonical_page_for_path(path: Path) -> bool:
+    return kb_core.canonical_page_for_path(repo_paths(), path)
+
+
+def canonical_kind_for_path(path: Path) -> str | None:
+    return kb_core.canonical_kind_for_path(repo_paths(), path)
+
+
+def validate_slug(slug: str) -> None:
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
+        die("slug must be kebab-case like `my-topic`")
+
+
+def normalize_metadata_list(values: list[str] | None, default: list[str] | None = None) -> list[str]:
+    normalized = kb_core.normalize_string_list(list(values or []))
+    if normalized:
+        return normalized
+    return list(default or [])
+
+
+def default_categories_for_kind(kind: str) -> list[str]:
+    return list(DEFAULT_PAGE_CATEGORIES.get(kind, []))
+
+
+def default_raw_bucket(domain: str) -> Path:
+    return RAW_ROOT / "domains" / domain
+
+
+def build_template(
+    kind: str,
+    title: str,
+    source_refs: list[str],
+    related: list[str],
+    domain: str,
+    industries: list[str],
+    categories: list[str],
+) -> str:
+    date = today_str()
+    meta = {
+        "title": title,
+        "type": kind,
+        "status": "active",
+        "created_at": date,
+        "updated_at": date,
+        "source_refs": source_refs,
+        "related": related,
+        "domain": domain,
+        "industries": industries,
+        "categories": categories,
+    }
+    frontmatter = render_frontmatter(meta)
+    sections = {
+        "source": "\n\n# {title}\n\n## Source Snapshot\n\n- Source kind: `TODO`\n- Raw copy: `TODO`\n- Role in corpus: `TODO`\n\n## Why It Matters\n\n- `TODO`\n\n## Key Claims\n\n- `TODO`\n\n## Related Pages\n\n- `TODO`\n",
+        "entity": "\n\n# {title}\n\n## Summary\n\n- `TODO`\n\n## Stable Claims\n\n- `TODO`\n\n## Related Pages\n\n- `TODO`\n",
+        "concept": "\n\n# {title}\n\n## Summary\n\n- `TODO`\n\n## Stable Claims\n\n- `TODO`\n\n## Practical Meaning\n\n- `TODO`\n\n## Related Pages\n\n- `TODO`\n",
+        "synthesis": "\n\n# {title}\n\n## Current Thesis\n\n- `TODO`\n\n## Stable Conclusions\n\n- `TODO`\n\n## Open Questions\n\n- `TODO`\n\n## Related Pages\n\n- `TODO`\n",
+        "domain": "\n\n# {title}\n\n## Role\n\n- `TODO`\n\n## Scope\n\n- `TODO`\n\n## Main Entry\n\n- `TODO`\n\n## Current State\n\n- `TODO`\n\n## Rule For Expansion\n\n- `TODO`\n",
+        "report": "\n\n# {title}\n\n## Purpose\n\n- `TODO`\n\n## Findings\n\n- `TODO`\n\n## Recommendation\n\n- `TODO`\n",
+    }
+    return frontmatter + sections[kind].format(title=title)
+
+
+def cmd_status(_: argparse.Namespace) -> int:
+    counts = {kind: len(sorted(spec["dir"].glob("*.md"))) for kind, spec in PAGE_LAYOUT.items()}
+    labels = {
+        "source": "sources",
+        "entity": "entities",
+        "concept": "concepts",
+        "synthesis": "syntheses",
+        "domain": "domains",
+        "report": "reports",
+    }
+    print("knowledge-base status")
+    print(f"- repo: {REPO_ROOT}")
+    print(f"- canonical pages: {sum(counts[k] for k in ['source', 'entity', 'concept', 'synthesis', 'domain'])}")
+    print(f"- reports: {counts['report']}")
+    for kind in ("source", "entity", "concept", "synthesis", "domain", "report"):
+        print(f"- {labels[kind]}: {counts[kind]}")
+    return 0
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    validate_slug(args.slug)
+    destination = page_destination(args.kind, args.slug)
+    if destination.exists():
+        die(f"page already exists: {repo_rel(destination)}")
+
+    domain = kb_core.normalize_tag_value(getattr(args, "domain", None) or FOUNDING_DOMAIN)
+    if not domain:
+        die("domain must not be empty")
+    industries = normalize_metadata_list(getattr(args, "industry", None), default=FOUNDING_INDUSTRIES)
+    categories = normalize_metadata_list(getattr(args, "category", None), default=default_categories_for_kind(args.kind))
+    source_refs = [normalize_reference_for_page(destination, item) for item in (args.source_ref or [])]
+    related = [normalize_reference_for_page(destination, item) for item in (args.related or [])]
+    raw_ref: str | None = normalize_reference_for_page(destination, args.raw_ref) if args.raw_ref else None
+    import_from = Path(args.import_from).expanduser().resolve() if args.import_from else None
+    raw_destination: Path | None = None
+
+    if args.kind == "source":
+        if import_from and not import_from.exists():
+            die(f"import source not found: {import_from}")
+        if import_from:
+            if args.raw_dest:
+                raw_destination = normalize_repo_path(args.raw_dest)
+            else:
+                raw_destination = (default_raw_bucket(domain) / "inbox" / import_from.name).resolve()
+            try:
+                raw_destination.relative_to(RAW_ROOT)
+            except ValueError as exc:
+                raise SystemExit(f"error: raw destination must stay inside raw/: {raw_destination}") from exc
+            raw_ref = raw_destination.relative_to(destination.parent).as_posix()
+        if raw_ref:
+            source_refs = [raw_ref]
+        if not source_refs:
+            die("source pages need `--raw-ref` or `--import-from`")
+
+    content = build_template(args.kind, args.title, source_refs, related, domain, industries, categories)
+    if args.dry_run:
+        print(f"would create: {repo_rel(destination)}")
+        if import_from and raw_destination is not None:
+            print(f"would copy raw: {import_from} -> {repo_rel(raw_destination)}")
+        print("")
+        print(content)
+        return 0
+
+    if import_from and raw_destination is not None:
+        ensure_parent(raw_destination)
+        shutil.copy2(import_from, raw_destination)
+    dump_text(destination, content)
+    ensure_index_entry(destination)
+
+    print(f"created: {repo_rel(destination)}")
+    if import_from and raw_destination is not None:
+        print(f"copied raw: {repo_rel(raw_destination)}")
+    if args.write_log:
+        log_notes = [f"Added {repo_rel(destination)}"]
+        if raw_destination is not None:
+            log_notes.append(f"Imported {repo_rel(raw_destination)}")
+        if args.dry_run:
+            print("would append log:")
+            print(write_log_entry("ingest", f"add {destination.stem}", log_notes, dry_run=True))
+        else:
+            write_log_entry("ingest", f"add {destination.stem}", log_notes, dry_run=False)
+            print(f"log updated: {repo_rel(LOG_PATH)}")
+    print("next:")
+    print(f"- {REPO_ROOT / 'kb'} log ingest --summary \"add {destination.stem}\" --note \"Added {repo_rel(destination)}\"")
+    print(f"- {REPO_ROOT / 'kb'} maintain")
+    return 0
+
+
+def append_log_entry(content: str, action: str, summary: str, notes: list[str]) -> str:
+    block = [f"## [{today_str()}] {action} | {summary}", ""]
+    block.extend(f"- {note}" for note in notes)
+    block.append("")
+    suffix = "\n".join(block)
+    if content.endswith("\n"):
+        return content + suffix
+    return content + "\n" + suffix
+
+
+def write_log_entry(action: str, summary: str, notes: list[str], dry_run: bool) -> str:
+    if not LOG_PATH.exists():
+        die(f"log file missing: {repo_rel(LOG_PATH)}")
+    if not notes:
+        die("log needs at least one `--note`")
+    log_page = load_page(LOG_PATH)
+    current_body = log_page.body
+    updated_body = append_log_entry(current_body, action, summary, notes)
+    if dry_run:
+        return updated_body[len(current_body):].strip()
+    updated_meta = dict(log_page.meta)
+    updated_meta["updated_at"] = today_str()
+    dump_text(LOG_PATH, render_page(updated_meta, updated_body))
+    return repo_rel(LOG_PATH)
+
+
+def cmd_log(args: argparse.Namespace) -> int:
+    notes = list(args.note or [])
+    result = write_log_entry(args.action, args.summary, notes, dry_run=args.dry_run)
+    if args.dry_run:
+        print(result)
+        return 0
+    print(f"updated: {repo_rel(LOG_PATH)}")
+    return 0
+
+
+def extract_markdown_links(page: Page) -> list[tuple[str, Path]]:
+    links: list[tuple[str, Path]] = []
+    for raw_target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", page.body):
+        target = raw_target.strip()
+        if target.startswith(("http://", "https://", "mailto:", "#")):
+            continue
+        target_path = target.split("#", 1)[0]
+        if not target_path:
+            continue
+        resolved = (page.path.parent / target_path).resolve()
+        links.append((target, resolved))
+    return links
+
+
+def extract_frontmatter_links(page: Page) -> list[tuple[str, Path]]:
+    links: list[tuple[str, Path]] = []
+    for key in ("source_refs", "related"):
+        values = page.meta.get(key, [])
+        if not isinstance(values, list):
+            continue
+        for raw_target in values:
+            target = str(raw_target).strip()
+            if not target:
+                continue
+            resolved = resolve_repo_reference(page.path, target)
+            links.append((target, resolved))
+    return links
+
+
+def path_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def duplicate_resolved_refs(page: Page, key: str) -> list[str]:
+    values = page.meta.get(key, [])
+    if not isinstance(values, list):
+        return []
+
+    duplicates: list[str] = []
+    seen: set[str] = set()
+    for raw_value in values:
+        target = str(raw_value).strip()
+        if not target:
+            continue
+        resolved = resolve_repo_reference(page.path, target)
+        try:
+            normalized = repo_rel(resolved)
+        except ValueError:
+            normalized = str(resolved)
+        if normalized in seen and normalized not in duplicates:
+            duplicates.append(normalized)
+            continue
+        seen.add(normalized)
+    return duplicates
+
+
+def resolved_frontmatter_refs(page: Page, key: str) -> list[tuple[str, Path]]:
+    values = page.meta.get(key, [])
+    if not isinstance(values, list):
+        return []
+    refs: list[tuple[str, Path]] = []
+    for raw_value in values:
+        target = str(raw_value).strip()
+        if not target:
+            continue
+        refs.append((target, resolve_repo_reference(page.path, target)))
+    return refs
+
+
+def page_reference_targets(page: Page) -> set[Path]:
+    targets = {resolved for _, resolved in extract_markdown_links(page)}
+    targets.update(resolved for _, resolved in extract_frontmatter_links(page))
+    return targets
+
+
+def guide_page_specs() -> dict[str, dict[str, object]]:
+    return {
+        "index": {
+            "path": INDEX_PATH,
+            "expected_type": "guide",
+            "required_links": [WIKI_ROOT / "overview.md", WIKI_ROOT / "hot.md", LOG_PATH],
+        },
+        "overview": {
+            "path": WIKI_ROOT / "overview.md",
+            "expected_type": "guide",
+            "required_links": [INDEX_PATH, WIKI_ROOT / "hot.md", LOG_PATH],
+            "required_kinds": ["domain", "report"],
+        },
+        "hot": {
+            "path": WIKI_ROOT / "hot.md",
+            "expected_type": "guide",
+            "required_links": [INDEX_PATH, WIKI_ROOT / "overview.md", LOG_PATH],
+            "required_kinds": ["domain", "synthesis", "report"],
+        },
+        "log": {
+            "path": LOG_PATH,
+            "expected_type": "report",
+            "required_links": [INDEX_PATH, WIKI_ROOT / "overview.md"],
+        },
+    }
+
+
+def check_guide_health() -> list[Issue]:
+    issues: list[Issue] = []
+    for spec in guide_page_specs().values():
+        path = spec["path"]
+        assert isinstance(path, Path)
+        label = repo_rel(path)
+        if not path.exists():
+            issues.append(Issue("error", f"{label}: missing required knowledge-base guide page"))
+            continue
+
+        page = load_page(path)
+        if not page.has_frontmatter:
+            issues.append(Issue("error", f"{label}: missing frontmatter"))
+            continue
+
+        missing_keys = sorted(REQUIRED_FRONTMATTER_KEYS - set(page.meta))
+        if missing_keys:
+            issues.append(Issue("error", f"{label}: missing frontmatter keys {', '.join(missing_keys)}"))
+
+        expected_type = str(spec["expected_type"])
+        actual_type = str(page.meta.get("type") or "")
+        if actual_type != expected_type:
+            rendered_actual = actual_type or "missing"
+            issues.append(Issue("warn", f"{label}: expected type `{expected_type}` but found `{rendered_actual}`"))
+
+        for raw_target, resolved in extract_frontmatter_links(page):
+            if not resolved.exists():
+                issues.append(Issue("error", f"{label}: broken frontmatter ref -> {raw_target}"))
+        for raw_target, resolved in extract_markdown_links(page):
+            if not resolved.exists():
+                issues.append(Issue("error", f"{label}: broken link -> {raw_target}"))
+
+        targets = page_reference_targets(page)
+        for required_path in spec.get("required_links", []):
+            assert isinstance(required_path, Path)
+            if required_path not in targets:
+                issues.append(Issue("warn", f"{label}: missing health link -> {repo_rel(required_path)}"))
+        for required_kind in spec.get("required_kinds", []):
+            kind = str(required_kind)
+            required_dir = PAGE_LAYOUT[kind]["dir"]
+            if not any(path_within(target, required_dir) for target in targets):
+                issues.append(Issue("warn", f"{label}: missing health link for `{kind}` pages"))
+
+    return issues
+
+
+def index_link_targets() -> set[str]:
+    page = load_page(INDEX_PATH)
+    targets: set[str] = set()
+    for raw_target, resolved in extract_markdown_links(page):
+        if resolved.exists() and canonical_page_for_path(resolved):
+            targets.add(repo_rel(resolved))
+        elif raw_target.startswith("./"):
+            maybe = (INDEX_PATH.parent / raw_target.split("#", 1)[0]).resolve()
+            try:
+                if canonical_page_for_path(maybe):
+                    targets.add(repo_rel(maybe))
+            except Exception:
+                pass
+    return targets
+
+
+def registered_domains() -> dict[str, Path]:
+    registry: dict[str, Path] = {}
+    for path in sorted(PAGE_LAYOUT["domain"]["dir"].glob("*.md")):
+        stem = path.stem
+        registry[stem.removeprefix("domain-")] = path
+    return registry
+
+
+def page_domain(page: Page) -> str:
+    return kb_core.normalize_tag_value(page.meta.get("domain"))
+
+
+def page_industries(page: Page) -> list[str]:
+    return kb_core.normalize_string_list(page.meta.get("industries"))
+
+
+def page_categories(page: Page) -> list[str]:
+    return kb_core.normalize_string_list(page.meta.get("categories"))
+
+
+def validate_metadata_list_type(page: Page, key: str, issues: list[Issue]) -> None:
+    value = page.meta.get(key)
+    if not isinstance(value, list):
+        issues.append(Issue("error", f"{page.repo_rel}: `{key}` must be a string list"))
+        return
+    for item in value:
+        if not str(item).strip():
+            issues.append(Issue("error", f"{page.repo_rel}: `{key}` contains an empty value"))
+
+
+def check_maintenance() -> tuple[dict[str, int], list[Issue]]:
+    counts = {kind: len(sorted(spec["dir"].glob("*.md"))) for kind, spec in PAGE_LAYOUT.items()}
+    issues: list[Issue] = []
+    indexed = index_link_targets() if INDEX_PATH.exists() else set()
+    domain_registry = registered_domains()
+
+    for path in canonical_pages():
+        page = load_page(path)
+        kind = canonical_kind_for_path(path) or "unknown"
+        if not page.has_frontmatter:
+            issues.append(Issue("error", f"{page.repo_rel}: missing frontmatter"))
+            continue
+        missing_keys = sorted(REQUIRED_CANONICAL_FRONTMATTER_KEYS - set(page.meta))
+        if missing_keys:
+            issues.append(Issue("error", f"{page.repo_rel}: missing frontmatter keys {', '.join(missing_keys)}"))
+        domain = page_domain(page)
+        if not domain:
+            issues.append(Issue("error", f"{page.repo_rel}: missing or invalid `domain`"))
+        elif domain not in domain_registry:
+            issues.append(Issue("error", f"{page.repo_rel}: domain `{domain}` is not registered in wiki/domains"))
+        if kind == "domain":
+            expected_domain = path.stem.removeprefix("domain-")
+            if domain and domain != expected_domain:
+                issues.append(Issue("error", f"{page.repo_rel}: domain registry mismatch, expected `{expected_domain}` but found `{domain}`"))
+        validate_metadata_list_type(page, "industries", issues)
+        validate_metadata_list_type(page, "categories", issues)
+        if kind in SOURCE_REF_REQUIRED_TYPES:
+            refs = page.meta.get("source_refs", [])
+            resolved_refs = resolved_frontmatter_refs(page, "source_refs")
+            if not isinstance(refs, list) or not refs:
+                issues.append(Issue("error", f"{page.repo_rel}: empty source_refs"))
+            elif kind == "source":
+                expected_raw_root = default_raw_bucket(domain) if domain else None
+                for raw_target, resolved in resolved_refs:
+                    if not resolved.exists():
+                        issues.append(Issue("error", f"{page.repo_rel}: broken frontmatter ref -> {raw_target}"))
+                    elif not path_within(resolved, RAW_ROOT):
+                        issues.append(Issue("error", f"{page.repo_rel}: source_refs should resolve inside raw/ -> {raw_target}"))
+                    elif expected_raw_root is not None and not path_within(resolved, expected_raw_root):
+                        issues.append(Issue("error", f"{page.repo_rel}: source_refs should stay inside {repo_rel(expected_raw_root)} -> {raw_target}"))
+            else:
+                source_dir = PAGE_LAYOUT["source"]["dir"]
+                for raw_target, resolved in resolved_refs:
+                    if not resolved.exists():
+                        issues.append(Issue("error", f"{page.repo_rel}: broken frontmatter ref -> {raw_target}"))
+                    elif not path_within(resolved, source_dir) and not path_within(resolved, RAW_ROOT):
+                        issues.append(Issue("error", f"{page.repo_rel}: source_refs should resolve to wiki/sources/ or raw/ -> {raw_target}"))
+                if kind in ANSWER_PAGE_TYPES:
+                    canonical_support = [resolved for _, resolved in resolved_refs if path_within(resolved, source_dir)]
+                    if refs and not canonical_support:
+                        issues.append(Issue("warn", f"{page.repo_rel}: source_refs should include at least one wiki/sources page"))
+            duplicate_refs = duplicate_resolved_refs(page, "source_refs")
+            for duplicate in duplicate_refs:
+                issues.append(Issue("warn", f"{page.repo_rel}: duplicate source_ref -> {duplicate}"))
+            for raw_target, resolved in resolved_refs:
+                if resolved == page.path:
+                    issues.append(Issue("warn", f"{page.repo_rel}: source_refs should not point to itself -> {raw_target}"))
+        related_values = page.meta.get("related", [])
+        if isinstance(related_values, list):
+            resolved_related = resolved_frontmatter_refs(page, "related")
+            for raw_target, resolved in resolved_related:
+                if not resolved.exists():
+                    issues.append(Issue("error", f"{page.repo_rel}: broken frontmatter ref -> {raw_target}"))
+                elif resolved == page.path:
+                    issues.append(Issue("warn", f"{page.repo_rel}: related should not point to itself -> {raw_target}"))
+            duplicate_related = duplicate_resolved_refs(page, "related")
+            for duplicate in duplicate_related:
+                issues.append(Issue("warn", f"{page.repo_rel}: duplicate related ref -> {duplicate}"))
+        for raw_target, resolved in extract_markdown_links(page):
+            if not resolved.exists():
+                issues.append(Issue("error", f"{page.repo_rel}: broken link -> {raw_target}"))
+        if kind in CANONICAL_TYPES and page.repo_rel not in indexed:
+            issues.append(Issue("warn", f"{page.repo_rel}: missing from wiki/index.md"))
+
+    if INDEX_PATH.exists():
+        index_page = load_page(INDEX_PATH)
+        for raw_target, resolved in extract_markdown_links(index_page):
+            if canonical_page_for_path(resolved) and not resolved.exists():
+                issues.append(Issue("warn", f"wiki/index.md: stale index entry -> {raw_target}"))
+
+    issues.extend(check_guide_health())
+    return counts, issues
+
+
+def render_maintenance_report(counts: dict[str, int], issues: list[Issue]) -> str:
+    date = today_str()
+    payload = build_maintenance_payload(counts, issues)
+    meta = {
+        "title": f"Maintenance Report {date}",
+        "type": "report",
+        "status": "active",
+        "created_at": date,
+        "updated_at": date,
+        "source_refs": [],
+        "related": ["../index.md", "../overview.md", "../log.md"],
+        "domain": FOUNDING_DOMAIN,
+        "industries": FOUNDING_INDUSTRIES,
+        "categories": ["maintenance", "health-check"],
+    }
+    lines = [
+        render_frontmatter(meta),
+        "",
+        f"# Maintenance Report {date}",
+        "",
+        "## Scope",
+        "",
+        "- Report type: `command-generated maintenance snapshot`",
+        f"- Checked on: `{date}`",
+        f"- Health verdict: `{payload['health_verdict']}`",
+        "",
+        "## Current Counts",
+        "",
+        f"- Sources: `{counts['source']}`",
+        f"- Entities: `{counts['entity']}`",
+        f"- Concepts: `{counts['concept']}`",
+        f"- Syntheses: `{counts['synthesis']}`",
+        f"- Domains: `{counts['domain']}`",
+        f"- Reports: `{counts['report']}`",
+        "",
+        "## Issue Summary",
+        "",
+    ]
+    issue_counts = payload["issue_counts"]
+    issue_groups = payload["issue_groups"]
+    recommendations = payload["recommendations"]
+    if issue_counts:
+        lines.extend(f"- {level}: `{count}`" for level, count in sorted(issue_counts.items()))
+    else:
+        lines.append("- issue counts: none")
+    if issue_groups:
+        lines.append("")
+        lines.append("## Findings By Category")
+        lines.append("")
+        for category, category_issues in issue_groups.items():
+            lines.append(f"### {category}")
+            lines.append("")
+            lines.extend(f"- [{item['level']}] {item['message']}" for item in category_issues)
+            lines.append("")
+    lines.extend(
+        [
+        "## Findings",
+        "",
+        ]
+    )
+    if issues:
+        lines.extend(f"- [{issue.level}] {issue.message}" for issue in issues)
+    else:
+        lines.append("- No issues found in this maintenance pass")
+    lines.extend(["", "## Recommendation", ""])
+    if recommendations:
+        lines.extend(f"- {item}" for item in recommendations)
+    else:
+        lines.append("- Fix any `error` items first, then rerun `kb maintain`")
+    return "\n".join(lines) + "\n"
+
+
+def maintenance_issue_counts(issues: list[Issue]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for issue in issues:
+        counts[issue.level] = counts.get(issue.level, 0) + 1
+    return counts
+
+
+def maintenance_health_verdict(issues: list[Issue]) -> str:
+    if any(issue.level == "error" for issue in issues):
+        return "failing"
+    if issues:
+        return "needs-attention"
+    return "healthy"
+
+
+def categorize_issue(issue: Issue) -> str:
+    message = issue.message
+    if "health link" in message or "guide page" in message:
+        return "guide-surface"
+    if "source_refs" in message or "source_ref" in message or "duplicate related ref" in message or "related should not point to itself" in message:
+        return "provenance"
+    if "frontmatter" in message or "domain `" in message or "`industries`" in message or "`categories`" in message:
+        return "frontmatter"
+    if "broken link" in message:
+        return "links"
+    if "wiki/index.md" in message or "missing from wiki/index.md" in message or "stale index entry" in message:
+        return "index"
+    return "general"
+
+
+def group_maintenance_issues(issues: list[Issue]) -> dict[str, list[dict[str, str]]]:
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for issue in issues:
+        category = categorize_issue(issue)
+        grouped.setdefault(category, []).append({"level": issue.level, "message": issue.message})
+    return grouped
+
+
+def maintenance_recommendations(issues: list[Issue]) -> list[str]:
+    categories = set(group_maintenance_issues(issues))
+    recommendations: list[str] = []
+    if any(issue.level == "error" for issue in issues):
+        recommendations.append("Fix any `error` items first, then rerun `kb maintain`.")
+    if "provenance" in categories:
+        recommendations.append("Repair weak or duplicated provenance so answer-like pages keep clear canonical support.")
+    if "guide-surface" in categories:
+        recommendations.append("Restore missing guide-surface links so `index`, `overview`, `hot`, and `log` stay navigable together.")
+    if "index" in categories:
+        recommendations.append("Reconcile `wiki/index.md` with the canonical graph, then rerun `kb reindex --write` if needed.")
+    if "links" in categories:
+        recommendations.append("Fix broken internal links before treating the graph as healthy.")
+    if "frontmatter" in categories:
+        recommendations.append("Restore missing or invalid frontmatter fields so maintenance and query tooling can trust the page metadata.")
+    if not recommendations:
+        recommendations.append("No action needed; rerun `kb maintain` after future graph changes.")
+    return recommendations
+
+
+def build_maintenance_payload(
+    counts: dict[str, int],
+    issues: list[Issue],
+    report_path: Path | None = None,
+    report_action: str | None = None,
+) -> dict[str, object]:
+    issue_groups = group_maintenance_issues(issues)
+    payload: dict[str, object] = {
+        "status": "error" if any(issue.level == "error" for issue in issues) else "ok",
+        "health_verdict": maintenance_health_verdict(issues),
+        "counts": counts,
+        "issue_counts": maintenance_issue_counts(issues),
+        "issue_groups": issue_groups,
+        "issues": [{"level": issue.level, "category": categorize_issue(issue), "message": issue.message} for issue in issues],
+        "recommendations": maintenance_recommendations(issues),
+    }
+    if report_path is not None:
+        payload["report_path"] = repo_rel(report_path)
+    if report_action is not None:
+        payload["report_action"] = report_action
+    return payload
+
+
+def render_maintenance_summary(
+    counts: dict[str, int],
+    issues: list[Issue],
+    as_json: bool,
+    report_path: Path | None = None,
+    report_action: str | None = None,
+) -> str:
+    if as_json:
+        return json.dumps(
+            build_maintenance_payload(counts, issues, report_path=report_path, report_action=report_action),
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    lines = [
+        "maintenance summary",
+        f"- health_verdict: {maintenance_health_verdict(issues)}",
+        f"- sources: {counts['source']}",
+        f"- entities: {counts['entity']}",
+        f"- concepts: {counts['concept']}",
+        f"- syntheses: {counts['synthesis']}",
+        f"- domains: {counts['domain']}",
+        f"- reports: {counts['report']}",
+    ]
+    issue_counts = maintenance_issue_counts(issues)
+    if issue_counts:
+        rendered_counts = ", ".join(f"{level}={count}" for level, count in sorted(issue_counts.items()))
+        lines.append(f"- issue_counts: {rendered_counts}")
+    issue_groups = group_maintenance_issues(issues)
+    if issue_groups:
+        rendered_groups = ", ".join(f"{category}={len(items)}" for category, items in sorted(issue_groups.items()))
+        lines.append(f"- issue_groups: {rendered_groups}")
+    if report_path is not None:
+        verb = "would write" if report_action == "would_write" else "wrote"
+        lines.append(f"- report: {verb} {repo_rel(report_path)}")
+    if issues:
+        lines.append("- issues:")
+        for issue in issues:
+            lines.append(f"  - [{issue.level}][{categorize_issue(issue)}] {issue.message}")
+    else:
+        lines.append("- issues: none")
+    return "\n".join(lines)
+
+
+def next_maintenance_report_path() -> Path:
+    report_path = WIKI_ROOT / "reports" / f"report-maintenance-{today_str()}.md"
+    suffix = 2
+    while report_path.exists():
+        report_path = WIKI_ROOT / "reports" / f"report-maintenance-{today_str()}-{suffix}.md"
+        suffix += 1
+    return report_path
+
+
+def next_drift_review_report_path() -> Path:
+    report_path = WIKI_ROOT / "reports" / f"report-drift-review-{today_str()}.md"
+    suffix = 2
+    while report_path.exists():
+        report_path = WIKI_ROOT / "reports" / f"report-drift-review-{today_str()}-{suffix}.md"
+        suffix += 1
+    return report_path
+
+
+def cmd_maintain(args: argparse.Namespace) -> int:
+    counts, issues = check_maintenance()
+    summary_counts = counts
+    summary_issues = issues
+    report_path: Path | None = None
+    report_action: str | None = None
+
+    if args.write_report:
+        report_path = next_maintenance_report_path()
+        content = render_maintenance_report(counts, issues)
+        if args.dry_run:
+            report_action = "would_write"
+        else:
+            dump_text(report_path, content)
+            ensure_index_entry(report_path)
+            report_action = "written"
+            summary_counts, summary_issues = check_maintenance()
+    print(
+        render_maintenance_summary(
+            summary_counts,
+            summary_issues,
+            as_json=args.json,
+            report_path=report_path,
+            report_action=report_action,
+        )
+    )
+    return 0 if not any(issue.level == "error" for issue in summary_issues) else 1
+
+
+def signal_sort_key(signal: DriftSignal) -> tuple[int, str, str]:
+    priority = {"warn": 0, "info": 1}.get(signal.level, 2)
+    return (priority, signal.category, signal.page)
+
+
+def page_updated_at(page: Page) -> datetime | None:
+    return parse_timestamp(page.meta.get("updated_at"))
+
+
+def canonical_source_support_pages(page: Page) -> list[Page]:
+    source_dir = PAGE_LAYOUT["source"]["dir"]
+    supports: list[Page] = []
+    for _, resolved in resolved_frontmatter_refs(page, "source_refs"):
+        if resolved.exists() and path_within(resolved, source_dir):
+            supports.append(load_page(resolved))
+    return supports
+
+
+def latest_log_entry_date(log_page: Page) -> datetime | None:
+    candidates: list[datetime] = []
+    for match in re.finditer(r"^## \[(\d{4}-\d{2}-\d{2})\]", log_page.body, re.MULTILINE):
+        parsed = parse_timestamp(match.group(1))
+        if parsed is not None:
+            candidates.append(parsed)
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def guide_target_pages(page: Page) -> list[Page]:
+    targets: list[Page] = []
+    seen: set[Path] = set()
+    for _, resolved in extract_markdown_links(page):
+        if not resolved.exists() or not canonical_page_for_path(resolved) or resolved in seen:
+            continue
+        seen.add(resolved)
+        targets.append(load_page(resolved))
+    return targets
+
+
+def latest_report_update() -> datetime | None:
+    updates = [page_updated_at(load_page(path)) for path in sorted(PAGE_LAYOUT["report"]["dir"].glob("*.md"))]
+    known = [item for item in updates if item is not None]
+    if not known:
+        return None
+    return max(known)
+
+
+def latest_canonical_update() -> datetime | None:
+    updates = [page_updated_at(load_page(path)) for path in canonical_pages()]
+    known = [item for item in updates if item is not None]
+    if not known:
+        return None
+    return max(known)
+
+
+def drift_review_signals() -> list[DriftSignal]:
+    signals: list[DriftSignal] = []
+
+    for path in canonical_pages():
+        kind = canonical_kind_for_path(path)
+        if kind not in {"entity", "concept", "synthesis", "domain"}:
+            continue
+        page = load_page(path)
+        page_updated = page_updated_at(page)
+        if page_updated is None:
+            continue
+        newer_supports: list[str] = []
+        for support_page in canonical_source_support_pages(page):
+            support_updated = page_updated_at(support_page)
+            if support_updated is not None and support_updated > page_updated:
+                newer_supports.append(repo_rel(support_page.path))
+        if newer_supports:
+            signals.append(
+                DriftSignal(
+                    level="warn",
+                    category="source-lag",
+                    page=page.repo_rel,
+                    message="page may be stale because supporting source pages were updated later",
+                    related_paths=sorted(newer_supports),
+                )
+            )
+
+    for guide_path in (INDEX_PATH, WIKI_ROOT / "overview.md", WIKI_ROOT / "hot.md"):
+        if not guide_path.exists():
+            continue
+        page = load_page(guide_path)
+        guide_updated = page_updated_at(page)
+        if guide_updated is None:
+            continue
+        newer_targets: list[str] = []
+        for target_page in guide_target_pages(page):
+            target_updated = page_updated_at(target_page)
+            if target_updated is not None and target_updated > guide_updated:
+                newer_targets.append(repo_rel(target_page.path))
+        if newer_targets:
+            signals.append(
+                DriftSignal(
+                    level="info",
+                    category="guide-lag",
+                    page=page.repo_rel,
+                    message="guide page may need review because linked canonical pages were updated later",
+                    related_paths=sorted(newer_targets),
+                )
+            )
+
+    if LOG_PATH.exists():
+        log_page = load_page(LOG_PATH)
+        log_updated = page_updated_at(log_page)
+        latest_entry = latest_log_entry_date(log_page)
+        if log_updated is not None and latest_entry is not None and latest_entry > log_updated:
+            signals.append(
+                DriftSignal(
+                    level="info",
+                    category="metadata-lag",
+                    page=log_page.repo_rel,
+                    message="frontmatter updated_at is older than the latest dated log entry",
+                    related_paths=[],
+                )
+            )
+
+    latest_report = latest_report_update()
+    latest_canonical = latest_canonical_update()
+    if latest_report is not None and latest_canonical is not None and latest_canonical > latest_report:
+        report_paths = [repo_rel(path) for path in sorted(PAGE_LAYOUT["report"]["dir"].glob("*.md"))]
+        signals.append(
+            DriftSignal(
+                level="info",
+                category="report-lag",
+                page="wiki/reports",
+                message="report layer may need refresh because canonical pages were updated later than the newest report",
+                related_paths=report_paths,
+            )
+        )
+
+    return sorted(signals, key=signal_sort_key)
+
+
+def drift_signal_counts(signals: list[DriftSignal]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for signal in signals:
+        counts[signal.level] = counts.get(signal.level, 0) + 1
+    return counts
+
+
+def drift_signal_groups(signals: list[DriftSignal]) -> dict[str, list[dict[str, object]]]:
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for signal in signals:
+        grouped.setdefault(signal.category, []).append(
+            {
+                "level": signal.level,
+                "page": signal.page,
+                "message": signal.message,
+                "related_paths": signal.related_paths,
+            }
+        )
+    return grouped
+
+
+def drift_review_verdict(signals: list[DriftSignal]) -> str:
+    if any(signal.level == "warn" for signal in signals):
+        return "review-needed"
+    if signals:
+        return "watch"
+    return "stable"
+
+
+def drift_review_recommendations(signals: list[DriftSignal]) -> list[str]:
+    categories = set(signal.category for signal in signals)
+    recommendations: list[str] = []
+    if "source-lag" in categories:
+        recommendations.append("Review answer-like pages whose supporting source pages changed later, then refresh their conclusions if needed.")
+    if "guide-lag" in categories:
+        recommendations.append("Review guide-surface pages so navigation still reflects the newest canonical entry points.")
+    if "metadata-lag" in categories:
+        recommendations.append("Refresh `updated_at` metadata when guide or log pages receive meaningful changes.")
+    if "report-lag" in categories:
+        recommendations.append("Consider writing a fresh report if the report layer is older than the current canonical graph.")
+    if not recommendations:
+        recommendations.append("No drift signals detected; rerun `kb drift-review` after future graph changes.")
+    return recommendations
+
+
+def build_drift_review_payload(
+    signals: list[DriftSignal],
+    report_path: Path | None = None,
+    report_action: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "status": "attention" if signals else "ok",
+        "drift_verdict": drift_review_verdict(signals),
+        "signal_counts": drift_signal_counts(signals),
+        "signal_groups": drift_signal_groups(signals),
+        "signals": [
+            {
+                "level": signal.level,
+                "category": signal.category,
+                "page": signal.page,
+                "message": signal.message,
+                "related_paths": signal.related_paths,
+            }
+            for signal in signals
+        ],
+        "recommendations": drift_review_recommendations(signals),
+    }
+    if report_path is not None:
+        payload["report_path"] = repo_rel(report_path)
+    if report_action is not None:
+        payload["report_action"] = report_action
+    return payload
+
+
+def render_drift_review_summary(
+    signals: list[DriftSignal],
+    as_json: bool,
+    report_path: Path | None = None,
+    report_action: str | None = None,
+) -> str:
+    payload = build_drift_review_payload(signals, report_path=report_path, report_action=report_action)
+    if as_json:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    lines = [
+        "drift review",
+        f"- drift_verdict: {payload['drift_verdict']}",
+    ]
+    signal_counts = payload["signal_counts"]
+    if signal_counts:
+        rendered_counts = ", ".join(f"{level}={count}" for level, count in sorted(signal_counts.items()))
+        lines.append(f"- signal_counts: {rendered_counts}")
+    else:
+        lines.append("- signal_counts: none")
+    signal_groups = payload["signal_groups"]
+    if signal_groups:
+        rendered_groups = ", ".join(f"{category}={len(items)}" for category, items in sorted(signal_groups.items()))
+        lines.append(f"- signal_groups: {rendered_groups}")
+    if report_path is not None:
+        verb = "would write" if report_action == "would_write" else "wrote"
+        lines.append(f"- report: {verb} {repo_rel(report_path)}")
+    if signals:
+        lines.append("- signals:")
+        for signal in signals:
+            lines.append(f"  - [{signal.level}][{signal.category}] {signal.page}: {signal.message}")
+            if signal.related_paths:
+                lines.append(f"    related: {', '.join(signal.related_paths)}")
+    else:
+        lines.append("- signals: none")
+    return "\n".join(lines)
+
+
+def render_drift_review_report(signals: list[DriftSignal]) -> str:
+    date = today_str()
+    payload = build_drift_review_payload(signals)
+    meta = {
+        "title": f"Drift Review {date}",
+        "type": "report",
+        "status": "active",
+        "created_at": date,
+        "updated_at": date,
+        "source_refs": [],
+        "related": ["../index.md", "../overview.md", "../hot.md", "../log.md"],
+        "domain": FOUNDING_DOMAIN,
+        "industries": FOUNDING_INDUSTRIES,
+        "categories": ["maintenance", "drift-review"],
+    }
+    lines = [
+        render_frontmatter(meta),
+        "",
+        f"# Drift Review {date}",
+        "",
+        "## Scope",
+        "",
+        "- Report type: `command-generated drift review`",
+        f"- Checked on: `{date}`",
+        f"- Drift verdict: `{payload['drift_verdict']}`",
+        "",
+        "## Signal Summary",
+        "",
+    ]
+    signal_counts = payload["signal_counts"]
+    if signal_counts:
+        lines.extend(f"- {level}: `{count}`" for level, count in sorted(signal_counts.items()))
+    else:
+        lines.append("- signal counts: none")
+    signal_groups = payload["signal_groups"]
+    if signal_groups:
+        lines.extend(["", "## Signals By Category", ""])
+        for category, items in signal_groups.items():
+            lines.append(f"### {category}")
+            lines.append("")
+            for item in items:
+                lines.append(f"- [{item['level']}] {item['page']}: {item['message']}")
+                if item["related_paths"]:
+                    lines.append(f"  - related: {', '.join(item['related_paths'])}")
+            lines.append("")
+    lines.extend(["## Recommendations", ""])
+    lines.extend(f"- {item}" for item in payload["recommendations"])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def projected_signals_after_drift_report_write(signals: list[DriftSignal]) -> list[DriftSignal]:
+    # Writing a fresh drift-review report resolves the report-lag it is
+    # explicitly documenting, so the archived report should reflect the
+    # post-write repository state instead of the stale pre-write snapshot.
+    return [signal for signal in signals if signal.category != "report-lag"]
+
+
+def cmd_drift_review(args: argparse.Namespace) -> int:
+    signals = drift_review_signals()
+    summary_signals = signals
+    report_path: Path | None = None
+    report_action: str | None = None
+
+    if args.write_report:
+        report_path = next_drift_review_report_path()
+        if args.dry_run:
+            report_action = "would_write"
+        else:
+            content = render_drift_review_report(projected_signals_after_drift_report_write(signals))
+            dump_text(report_path, content)
+            ensure_index_entry(report_path)
+            report_action = "written"
+            summary_signals = drift_review_signals()
+
+    print(render_drift_review_summary(summary_signals, as_json=args.json, report_path=report_path, report_action=report_action))
+    return 0
+
+
+def section_bullets_for_heading(content_lines: list[str]) -> set[str]:
+    targets: set[str] = set()
+    for line in content_lines:
+        match = re.search(r"\]\((\./[^)]+\.md)\)", line)
+        if match:
+            targets.add(match.group(1))
+    return targets
+
+
+def autogenerated_index_line(path: Path) -> str:
+    page = load_page(path)
+    title = str(page.meta.get("title") or path.stem)
+    kind = canonical_kind_for_path(path) or "page"
+    return f"- [{path.stem}]({wiki_link(path)}): Auto-added {kind} page for \"{title}\""
+
+
+def split_h2_sections(lines: list[str]) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    preamble: list[str] = []
+    sections: list[tuple[str, list[str]]] = []
+    current_heading: str | None = None
+    current_lines: list[str] = []
+    for line in lines:
+        if line.startswith("## "):
+            if current_heading is not None:
+                sections.append((current_heading, current_lines))
+                current_lines = []
+            current_heading = line
+            continue
+        if current_heading is None:
+            preamble.append(line)
+        else:
+            current_lines.append(line)
+    if current_heading is None:
+        return preamble, []
+    sections.append((current_heading, current_lines))
+    return preamble, sections
+
+
+def ensure_index_entry(path: Path) -> bool:
+    if not INDEX_PATH.exists():
+        return False
+
+    kind = canonical_kind_for_path(path)
+    if kind is None:
+        return False
+
+    index_page = load_page(INDEX_PATH)
+    body_lines = index_page.body.lstrip("\n").splitlines()
+    preamble, sections = split_h2_sections(body_lines)
+    heading = PAGE_LAYOUT[kind]["index_heading"]
+    target_link = wiki_link(path)
+    changed = False
+    found_section = False
+    rebuilt_sections: list[tuple[str, list[str]]] = []
+
+    for section_heading, content_lines in sections:
+        if section_heading != heading:
+            rebuilt_sections.append((section_heading, content_lines))
+            continue
+
+        found_section = True
+        current_targets = section_bullets_for_heading(content_lines)
+        new_lines = list(content_lines)
+        if target_link not in current_targets:
+            if new_lines and new_lines[-1].strip():
+                new_lines.append("")
+            new_lines.append(autogenerated_index_line(path))
+            changed = True
+        rebuilt_sections.append((section_heading, new_lines))
+
+    if not found_section:
+        rebuilt_sections.append((heading, ["", autogenerated_index_line(path)]))
+        changed = True
+
+    if not changed:
+        return False
+
+    rebuilt: list[str] = []
+    rebuilt.extend(preamble)
+    for section_heading, content_lines in rebuilt_sections:
+        rebuilt.append(section_heading)
+        rebuilt.extend(content_lines)
+
+    updated_meta = dict(index_page.meta)
+    updated_meta["updated_at"] = today_str()
+    dump_text(INDEX_PATH, render_page(updated_meta, "\n".join(rebuilt)))
+    return True
+
+
+def desired_paths_by_heading() -> dict[str, list[Path]]:
+    mapping: dict[str, list[Path]] = {}
+    for kind, spec in PAGE_LAYOUT.items():
+        mapping[spec["index_heading"]] = sorted(spec["dir"].glob("*.md"))
+    return mapping
+
+
+def cmd_reindex(args: argparse.Namespace) -> int:
+    if not INDEX_PATH.exists():
+        die("wiki/index.md is missing")
+    index_page = load_page(INDEX_PATH)
+    body_lines = index_page.body.lstrip("\n").splitlines()
+    preamble, sections = split_h2_sections(body_lines)
+    desired = desired_paths_by_heading()
+    missing_total: list[str] = []
+    stale_total: list[str] = []
+    updated_sections: list[tuple[str, list[str]]] = []
+
+    for heading, content_lines in sections:
+        if heading not in desired:
+            updated_sections.append((heading, content_lines))
+            continue
+        current_targets = section_bullets_for_heading(content_lines)
+        desired_targets = {wiki_link(path) for path in desired[heading]}
+        missing = sorted(desired_targets - current_targets)
+        stale = sorted(current_targets - desired_targets)
+        missing_total.extend(f"{heading}: {item}" for item in missing)
+        stale_total.extend(f"{heading}: {item}" for item in stale)
+
+        new_lines: list[str] = []
+        for line in content_lines:
+            match = re.search(r"\]\((\./[^)]+\.md)\)", line)
+            if args.prune and match and match.group(1) in stale:
+                continue
+            new_lines.append(line)
+        if args.write and missing:
+            if new_lines and new_lines[-1].strip():
+                new_lines.append("")
+            for link in missing:
+                target_path = (INDEX_PATH.parent / link).resolve()
+                new_lines.append(autogenerated_index_line(target_path))
+        updated_sections.append((heading, new_lines))
+
+    if missing_total:
+        print("missing index entries:")
+        for item in missing_total:
+            print(f"- {item}")
+    else:
+        print("missing index entries: none")
+    if stale_total:
+        print("stale index entries:")
+        for item in stale_total:
+            print(f"- {item}")
+    else:
+        print("stale index entries: none")
+
+    if not args.write and not args.prune:
+        return 0
+
+    rebuilt: list[str] = []
+    rebuilt.extend(preamble)
+    for heading, content_lines in updated_sections:
+        rebuilt.append(heading)
+        rebuilt.extend(content_lines)
+    updated_body = "\n".join(rebuilt).rstrip() + "\n"
+
+    if args.dry_run:
+        print("")
+        print("would update wiki/index.md")
+        return 0
+    updated_meta = dict(index_page.meta)
+    updated_meta["updated_at"] = today_str()
+    dump_text(INDEX_PATH, render_page(updated_meta, updated_body))
+    print(f"updated: {repo_rel(INDEX_PATH)}")
+    return 0
+
+
+def move_to_trash(path: Path, stamp: str, dry_run: bool) -> Path:
+    trash_path = OUTPUT_ROOT / "trash" / stamp / path.relative_to(REPO_ROOT)
+    if dry_run:
+        return trash_path
+    ensure_parent(trash_path)
+    shutil.move(str(path), str(trash_path))
+    return trash_path
+
+
+def remove_index_lines_for_path(path: Path, dry_run: bool) -> int:
+    if not INDEX_PATH.exists():
+        return 0
+    link = wiki_link(path)
+    index_page = load_page(INDEX_PATH)
+    body_lines = index_page.body.lstrip("\n").splitlines()
+    kept = [line for line in body_lines if link not in line]
+    removed = len(body_lines) - len(kept)
+    if removed and not dry_run:
+        updated_meta = dict(index_page.meta)
+        updated_meta["updated_at"] = today_str()
+        dump_text(INDEX_PATH, render_page(updated_meta, "\n".join(kept)))
+    return removed
+
+
+def cmd_delete(args: argparse.Namespace) -> int:
+    path = normalize_repo_path(args.path)
+    if not path.exists() or not path.is_file():
+        die(f"file not found: {repo_rel(path)}")
+    stamp = now_local().strftime("%Y%m%dT%H%M%S")
+    trash_target = move_to_trash(path, stamp, args.dry_run)
+    print(f"{'would move' if args.dry_run else 'moved'}: {repo_rel(path)} -> {repo_rel(trash_target)}")
+
+    raw_moves: list[tuple[Path, Path]] = []
+    if args.with_raw:
+        page = load_page(path)
+        refs = page.meta.get("source_refs", [])
+        if isinstance(refs, list):
+            for ref in refs:
+                raw_path = (page.path.parent / str(ref)).resolve()
+                try:
+                    raw_path.relative_to(REPO_ROOT)
+                except ValueError:
+                    continue
+                try:
+                    raw_path.relative_to(RAW_ROOT)
+                except ValueError:
+                    continue
+                if raw_path.exists() and raw_path.is_file():
+                    raw_target = move_to_trash(raw_path, stamp, args.dry_run)
+                    raw_moves.append((raw_path, raw_target))
+    for raw_path, raw_target in raw_moves:
+        print(f"{'would move' if args.dry_run else 'moved'} raw: {repo_rel(raw_path)} -> {repo_rel(raw_target)}")
+
+    removed = remove_index_lines_for_path(path, args.dry_run)
+    if removed:
+        print(f"{'would remove' if args.dry_run else 'removed'} {removed} index entr{'y' if removed == 1 else 'ies'}")
+    else:
+        print("index entries removed: none")
+    if args.write_log:
+        log_notes = [f"Deleted {repo_rel(path)}"]
+        log_notes.extend(f"Deleted raw {repo_rel(raw_path)}" for raw_path, _ in raw_moves)
+        if args.dry_run:
+            print("would append log:")
+            print(write_log_entry("maintenance", f"delete {path.stem}", log_notes, dry_run=True))
+        else:
+            write_log_entry("maintenance", f"delete {path.stem}", log_notes, dry_run=False)
+            print(f"log updated: {repo_rel(LOG_PATH)}")
+    print("next:")
+    print(f"- {REPO_ROOT / 'kb'} maintain")
+    print(f"- {REPO_ROOT / 'kb'} log maintenance --summary \"delete {path.stem}\" --note \"Deleted {repo_rel(path)}\"")
+    return 0
+
+
+def extract_sections(body: str) -> dict[str, list[str]]:
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in body.splitlines():
+        heading_match = re.match(r"^##\s+(.*)$", line)
+        if heading_match:
+            current = heading_match.group(1).strip()
+            sections.setdefault(current, [])
+            continue
+        if current is not None:
+            sections[current].append(line)
+    return sections
+
+
+def extract_candidate_facts(page: Page, limit: int) -> list[str]:
+    sections = extract_sections(page.body)
+    facts: list[str] = []
+    for heading in STABLE_HEADINGS:
+        for line in sections.get(heading, []):
+            stripped = line.strip()
+            if stripped.startswith("- "):
+                fact = stripped[2:].strip().replace("`", "")
+                if fact and "TODO" not in fact and not fact.startswith("["):
+                    facts.append(fact)
+            elif heading in {"Summary", "Current Thesis", "Recommendation"} and stripped and not stripped.startswith("#"):
+                facts.append(stripped.replace("`", ""))
+        if len(facts) >= limit:
+            break
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for fact in facts:
+        normalized = re.sub(r"\s+", " ", fact).strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            deduped.append(normalized)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def normalize_search_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def query_terms_from_parts(parts: list[str]) -> list[str]:
+    text = " ".join(parts)
+    return [term for term in (normalize_search_text(item) for item in re.split(r"\s+", text)) if term]
+
+
+def page_heading_lines(page: Page) -> list[str]:
+    headings: list[str] = []
+    for line in page.body.splitlines():
+        if line.startswith("#"):
+            headings.append(line.lstrip("#").strip())
+    return headings
+
+
+def page_text_lines(page: Page) -> list[str]:
+    lines: list[str] = []
+    for line in page.body.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- "):
+            stripped = stripped[2:].strip()
+        if stripped and "TODO" not in stripped:
+            lines.append(stripped.replace("`", ""))
+    return lines
+
+
+def matches_any_term(text: str, terms: list[str]) -> bool:
+    normalized = normalize_search_text(text)
+    return any(term in normalized for term in terms)
+
+
+def truncate_snippet(text: str, limit: int = 180) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def dedupe_strings(values: Iterable[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        compact = str(value).strip()
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        deduped.append(compact)
+    return deduped
+
+
+def resolve_meta_paths(page: Page, key: str) -> list[str]:
+    values = page.meta.get(key, [])
+    if not isinstance(values, list):
+        return []
+    resolved_values: list[str] = []
+    for raw_value in values:
+        target = str(raw_value).strip()
+        if not target:
+            continue
+        resolved = resolve_repo_reference(page.path, target)
+        try:
+            resolved_values.append(repo_rel(resolved))
+        except ValueError:
+            resolved_values.append(target)
+    return resolved_values
+
+
+def strip_locale_suffix(text: str) -> tuple[str, bool]:
+    normalized = normalize_search_text(text).replace("_", "-")
+    base = normalized
+    changed = False
+    while True:
+        updated = TRAILING_LOCALE_PAREN_RE.sub("", base)
+        updated = TRAILING_LOCALE_TOKEN_RE.sub("", updated)
+        updated = re.sub(r"\s+", " ", updated).strip(" -_")
+        if updated == base:
+            break
+        base = updated
+        changed = True
+    return base, changed
+
+
+def page_topic_stem(path: Path) -> str:
+    stem = path.stem
+    for spec in PAGE_LAYOUT.values():
+        prefix = str(spec["prefix"])
+        if stem.startswith(prefix):
+            stem = stem[len(prefix) :]
+            break
+    return stem.replace("_", " ").replace("-", " ")
+
+
+def query_dedupe_identity(result: QueryResult) -> dict[str, object]:
+    title_key, title_variant = strip_locale_suffix(result.title)
+    stem_key, stem_variant = strip_locale_suffix(page_topic_stem(result.path))
+    return {
+        "title_key": title_key,
+        "title_variant": title_variant,
+        "stem_key": stem_key,
+        "stem_variant": stem_variant,
+    }
+
+
+def query_quality_bonus(page: Page, source_refs: list[str], stable_facts: list[str]) -> int:
+    bonus = 0
+    if source_refs:
+        bonus += 1
+    if stable_facts:
+        bonus += 1
+    return bonus
+
+
+def query_locale_variant_penalty(page: Page) -> int:
+    title_variant = strip_locale_suffix(str(page.meta.get("title") or ""))[1]
+    stem_variant = strip_locale_suffix(page_topic_stem(page.path))[1]
+    return -2 if title_variant or stem_variant else 0
+
+
+def query_rank_score(page: Page, kind: str, match_score: int, source_refs: list[str], stable_facts: list[str]) -> int:
+    status = normalize_search_text(str(page.meta.get("status") or "active"))
+    kind_bonus = QUERY_KIND_BONUS.get(kind, 0)
+    status_bonus = QUERY_STATUS_BONUS.get(status, 0)
+    quality_bonus = query_quality_bonus(page, source_refs, stable_facts)
+    locale_variant_penalty = query_locale_variant_penalty(page)
+    return match_score + kind_bonus + status_bonus + quality_bonus + locale_variant_penalty
+
+
+def select_query_snippet(page: Page, terms: list[str]) -> str | None:
+    candidates: list[str] = []
+    candidates.extend(extract_candidate_facts(page, 8))
+    candidates.extend(page_heading_lines(page))
+    candidates.extend(page_text_lines(page))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        compact = re.sub(r"\s+", " ", candidate).strip()
+        if not compact or compact in seen:
+            continue
+        seen.add(compact)
+        if matches_any_term(compact, terms):
+            return truncate_snippet(compact)
+
+    for candidate in candidates:
+        compact = re.sub(r"\s+", " ", candidate).strip()
+        if compact:
+            return truncate_snippet(compact)
+    return None
+
+
+def query_result_for_page(page: Page, terms: list[str], phrase: str) -> QueryResult | None:
+    kind = canonical_kind_for_path(page.path)
+    if kind is None:
+        return None
+
+    title = str(page.meta.get("title") or page.path.stem)
+    title_text = normalize_search_text(title)
+    path_text = normalize_search_text(page.repo_rel)
+    headings = page_heading_lines(page)
+    heading_texts = [normalize_search_text(item) for item in headings]
+    stable_facts = extract_candidate_facts(page, 8)
+    stable_texts = [normalize_search_text(item) for item in stable_facts]
+    body_text = normalize_search_text(page.body)
+    combined_text = " ".join([title_text, path_text, *heading_texts, *stable_texts, body_text]).strip()
+
+    match_score = 0
+    matched_fields: list[str] = []
+
+    for term in terms:
+        if term in title_text:
+            match_score += 8
+            matched_fields.append("title")
+        if term in path_text:
+            match_score += 6
+            matched_fields.append("path")
+        if any(term in item for item in heading_texts):
+            match_score += 5
+            matched_fields.append("heading")
+        if any(term in item for item in stable_texts):
+            match_score += 6
+            matched_fields.append("stable-claim")
+        body_hits = body_text.count(term)
+        if body_hits:
+            match_score += min(body_hits, 3)
+            matched_fields.append("body")
+
+    if phrase:
+        if phrase in title_text:
+            match_score += 6
+            matched_fields.append("title-phrase")
+        elif phrase in combined_text:
+            match_score += 4
+            matched_fields.append("phrase")
+
+    if terms and all(term in combined_text for term in terms):
+        match_score += 3
+        matched_fields.append("all-terms")
+
+    if match_score == 0:
+        return None
+
+    source_refs = resolve_meta_paths(page, "source_refs")
+    related = resolve_meta_paths(page, "related")
+    score = query_rank_score(page, kind, match_score, source_refs, stable_facts)
+    deduped_fields = list(dict.fromkeys(matched_fields))
+    return QueryResult(
+        path=page.path,
+        kind=kind,
+        title=title,
+        match_score=match_score,
+        score=score,
+        matched_fields=deduped_fields,
+        snippet=select_query_snippet(page, terms),
+        source_refs=source_refs,
+        related=related,
+        suppressed_duplicates=[],
+    )
+
+
+def query_sort_key(result: QueryResult) -> tuple[int, int, str, str]:
+    return (result.score, result.match_score, result.kind, result.path.as_posix())
+
+
+def dedupe_query_results(results: list[QueryResult]) -> list[QueryResult]:
+    if len(results) < 2:
+        return results
+
+    identities = {result.path: query_dedupe_identity(result) for result in results}
+    stem_groups: dict[tuple[str, str], list[QueryResult]] = {}
+    title_groups: dict[tuple[str, str], list[QueryResult]] = {}
+
+    for result in results:
+        identity = identities[result.path]
+        stem_key = str(identity["stem_key"]).strip()
+        title_key = str(identity["title_key"]).strip()
+        if stem_key:
+            stem_groups.setdefault((result.kind, stem_key), []).append(result)
+        if title_key:
+            title_groups.setdefault((result.kind, title_key), []).append(result)
+
+    active_stem_groups = {
+        key
+        for key, members in stem_groups.items()
+        if len(members) > 1 and any(bool(identities[item.path]["stem_variant"]) for item in members)
+    }
+    active_title_groups = {
+        key
+        for key, members in title_groups.items()
+        if len(members) > 1 and any(bool(identities[item.path]["title_variant"]) for item in members)
+    }
+
+    deduped: list[QueryResult] = []
+    winners: dict[tuple[str, str, str], QueryResult] = {}
+    for result in results:
+        identity = identities[result.path]
+        group_key: tuple[str, str, str] | None = None
+        stem_key = (result.kind, str(identity["stem_key"]).strip())
+        title_key = (result.kind, str(identity["title_key"]).strip())
+        if stem_key in active_stem_groups:
+            group_key = ("stem", stem_key[0], stem_key[1])
+        elif title_key in active_title_groups:
+            group_key = ("title", title_key[0], title_key[1])
+
+        if group_key is None:
+            deduped.append(result)
+            continue
+
+        winner = winners.get(group_key)
+        if winner is None:
+            winners[group_key] = result
+            deduped.append(result)
+            continue
+
+        winner.suppressed_duplicates = dedupe_strings([*winner.suppressed_duplicates, repo_rel(result.path)])
+        winner.source_refs = dedupe_strings([*winner.source_refs, *result.source_refs])
+        winner.related = dedupe_strings([*winner.related, *result.related])
+        if winner.snippet is None and result.snippet is not None:
+            winner.snippet = result.snippet
+
+    return deduped
+
+
+def query_pages(
+    terms: list[str],
+    phrase: str,
+    kinds: set[str],
+    limit: int,
+    dedupe: bool = True,
+    domains: set[str] | None = None,
+    industries: set[str] | None = None,
+    categories: set[str] | None = None,
+) -> list[kb_core.QueryResult]:
+    filters = kb_core.QueryFilters(
+        domains={kb_core.normalize_tag_value(item) for item in (domains or set()) if str(item).strip()},
+        industries={kb_core.normalize_tag_value(item) for item in (industries or set()) if str(item).strip()},
+        categories={kb_core.normalize_tag_value(item) for item in (categories or set()) if str(item).strip()},
+    )
+    return kb_core.query_pages(repo_paths(), terms, phrase, kinds, limit, filters=filters, dedupe=dedupe)
+
+
+def render_query_results(query: str, results: list[QueryResult], as_json: bool) -> str:
+    if as_json:
+        return json.dumps(kb_core.query_payload(repo_paths(), query, results), ensure_ascii=False, indent=2)
+
+    lines = [f"query: {query}", f"results: {len(results)}"]
+    if not results:
+        lines.append("- no matches")
+        return "\n".join(lines)
+
+    for result in results:
+        lines.append(f"- [{result.kind}] {repo_rel(result.path)} (score: {result.score})")
+        lines.append(f"  title: {result.title}")
+        if result.match_score != result.score:
+            lines.append(f"  match_score: {result.match_score}")
+        lines.append(f"  matched: {', '.join(result.matched_fields)}")
+        if result.snippet:
+            lines.append(f"  snippet: {result.snippet}")
+        if getattr(result, "domain", ""):
+            lines.append(f"  domain: {result.domain}")
+        if getattr(result, "industries", None):
+            lines.append(f"  industries: {', '.join(result.industries)}")
+        if getattr(result, "categories", None):
+            lines.append(f"  categories: {', '.join(result.categories)}")
+        if result.source_refs:
+            lines.append(f"  source_refs: {', '.join(result.source_refs)}")
+        if result.related:
+            lines.append(f"  related: {', '.join(result.related)}")
+        if result.suppressed_duplicates:
+            lines.append(f"  suppressed_duplicates: {', '.join(result.suppressed_duplicates)}")
+    return "\n".join(lines)
+
+
+def cmd_query(args: argparse.Namespace) -> int:
+    query = " ".join(args.terms).strip()
+    terms = kb_core.query_terms_from_parts(args.terms)
+    if not terms:
+        die("query needs at least one search term")
+
+    kinds = set(args.type or [])
+    if not kinds:
+        kinds = set(CANONICAL_TYPES)
+        if not args.include_reports:
+            kinds.discard("report")
+
+    phrase = kb_core.normalize_search_text(query)
+    results = query_pages(
+        terms,
+        phrase,
+        kinds,
+        args.limit,
+        dedupe=not args.no_dedupe,
+        domains=set(args.domain or []),
+        industries=set(args.industry or []),
+        categories=set(args.category or []),
+    )
+    print(render_query_results(query, results, args.json))
+    return 0
+
+
+def workspace_memory_home() -> tuple[str, Path]:
+    index = json.loads(MEMORY_INDEX_PATH.read_text(encoding="utf-8"))
+    key = index["workspaces"].get(str(REPO_ROOT).lower(), {}).get("key")
+    if not key:
+        die("workspace is not registered in global memory index")
+    return key, MEMORY_HOME / "workspaces" / key
+
+
+def existing_candidate_path(candidate_root: Path, key: str) -> Path | None:
+    for path in (candidate_root / "reference").glob(f"*-{key}-*.md"):
+        return path
+    return None
+
+
+def render_reference_candidate(key: str, title: str, takeaway: str, source_path: str, workspace_key: str, created_at: str) -> str:
+    meta = {
+        "id": f"reference-{created_at[:10]}-{key}",
+        "key": key,
+        "scope": "workspace",
+        "type": "reference",
+        "created_at": created_at,
+        "last_confirmed_at": created_at,
+        "status": "candidate",
+        "confidence": "0.82",
+        "source_runs": json.dumps([], ensure_ascii=False),
+        "source_workspaces": json.dumps([workspace_key], ensure_ascii=False),
+        "source": source_path,
+    }
+    lines = ["---"]
+    for key_name, value in meta.items():
+        lines.append(f"{key_name}: {value}")
+    lines.extend(
+        [
+            "---",
+            "",
+            f"# {title}",
+            "",
+            "## Reference takeaway",
+            takeaway,
+            "",
+            "## Why it matters",
+            f"Distilled from the canonical knowledge-base page `{source_path}`.",
+            "",
+            "## How to reuse",
+            "Reuse this when the same cross-project knowledge or governance question appears.",
+            "",
+            "## Source",
+            source_path,
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def cmd_distill_memory(args: argparse.Namespace) -> int:
+    workspace_key, workspace_home = workspace_memory_home()
+    candidate_root = workspace_home / "candidates"
+    gathered: list[tuple[str, str]] = []
+
+    for page_arg in args.pages:
+        page_path = normalize_repo_path(page_arg)
+        page = load_page(page_path)
+        for fact in extract_candidate_facts(page, args.limit):
+            gathered.append((fact, repo_rel(page_path)))
+    for fact in args.fact or []:
+        gathered.append((fact.strip(), "manual-fact"))
+    if not gathered:
+        die("no candidate facts found; pass pages with stable bullets or use `--fact`")
+
+    written: list[Path] = []
+    now_iso = timestamp_str()
+    date_part = today_str()
+    for fact, source_path in gathered:
+        takeaway = fact
+        if not args.workspace_only and not re.search(r"(全局|所有项目|整个codex|整个 codex|整个app|整个 app|跨项目|以后都|统一默认)", takeaway, re.IGNORECASE):
+            takeaway = f"跨项目稳定结论：{takeaway}"
+        key = hashlib.sha1(takeaway.encode("utf-8")).hexdigest()[:12]
+        title = takeaway[:80]
+        existing = existing_candidate_path(candidate_root, key)
+        target = existing or candidate_root / "reference" / f"{date_part}-{key}-{slugify(title)}.md"
+        content = render_reference_candidate(key, title, takeaway, source_path, workspace_key, now_iso)
+        if args.dry_run:
+            print(f"would write: {target}")
+            print(f"- {takeaway}")
+        else:
+            dump_text(target, content)
+            written.append(target)
+            print(f"wrote: {target}")
+            print(f"- {takeaway}")
+
+    if args.dry_run or args.no_refresh:
+        if args.no_refresh:
+            print("refresh skipped by --no-refresh")
+        return 0
+
+    result = subprocess.run(
+        ["python3", str(REFRESH_SCRIPT), "--workspace-root", str(REPO_ROOT)],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.stdout.strip():
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        if result.stderr.strip():
+            print(result.stderr.strip(), file=sys.stderr)
+        return result.returncode
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="kb",
+        description="Lightweight maintenance commands for the knowledge-base workspace.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    status_parser = subparsers.add_parser("status", help="Show a quick workspace snapshot")
+    status_parser.set_defaults(func=cmd_status)
+
+    query_parser = subparsers.add_parser("query", aliases=["search", "ask"], help="Search canonical knowledge pages with lightweight provenance output")
+    query_parser.add_argument("terms", nargs="+", help="Search terms")
+    query_parser.add_argument("--type", choices=PAGE_LAYOUT.keys(), action="append", help="Limit search to one or more page types")
+    query_parser.add_argument("--domain", action="append", help="Limit search to one or more domain slugs")
+    query_parser.add_argument("--industry", action="append", help="Limit search to one or more industry tags")
+    query_parser.add_argument("--category", action="append", help="Limit search to one or more category tags")
+    query_parser.add_argument("--include-reports", action="store_true", help="Include report pages in the result set")
+    query_parser.add_argument("--no-dedupe", action="store_true", help="Keep raw duplicate mirror results instead of collapsing them")
+    query_parser.add_argument("--limit", type=int, default=5, help="Max number of results to show")
+    query_parser.add_argument("--json", action="store_true", help="Render machine-readable JSON output")
+    query_parser.set_defaults(func=cmd_query)
+
+    add_parser = subparsers.add_parser("add", aliases=["new"], help="Add a new knowledge-base page scaffold")
+    add_parser.add_argument("kind", choices=PAGE_LAYOUT.keys())
+    add_parser.add_argument("--slug", required=True)
+    add_parser.add_argument("--title", required=True)
+    add_parser.add_argument("--domain", default=FOUNDING_DOMAIN, help="Owning domain slug for the page")
+    add_parser.add_argument("--industry", action="append", help="Industry tag; repeat for multiple values")
+    add_parser.add_argument("--category", action="append", help="Category tag; repeat for multiple values")
+    add_parser.add_argument("--source-ref", action="append", help="Relative repo path to an existing supporting source page or raw file")
+    add_parser.add_argument("--related", action="append", help="Relative wiki path to a related page")
+    add_parser.add_argument("--raw-ref", help="Relative repo path to a raw source file")
+    add_parser.add_argument("--import-from", help="External file path to copy into raw/")
+    add_parser.add_argument("--raw-dest", help="Repo-relative destination under raw/ when using --import-from")
+    add_parser.add_argument("--write-log", action="store_true", help="Also append a default structured log entry after creation")
+    add_parser.add_argument("--dry-run", action="store_true")
+    add_parser.set_defaults(func=cmd_add)
+
+    log_parser = subparsers.add_parser("log", aliases=["note"], help="Append a structured entry to wiki/log.md")
+    log_parser.add_argument("action")
+    log_parser.add_argument("--summary", required=True)
+    log_parser.add_argument("--note", action="append")
+    log_parser.add_argument("--dry-run", action="store_true")
+    log_parser.set_defaults(func=cmd_log)
+
+    maintain_parser = subparsers.add_parser("maintain", aliases=["lint", "check"], help="Run lightweight maintenance checks")
+    maintain_parser.add_argument("--write-report", action="store_true")
+    maintain_parser.add_argument("--json", action="store_true", help="Render machine-readable maintenance output")
+    maintain_parser.add_argument("--dry-run", action="store_true")
+    maintain_parser.set_defaults(func=cmd_maintain)
+
+    drift_parser = subparsers.add_parser("drift-review", aliases=["drift"], help="Review likely graph drift and stale guide/report signals")
+    drift_parser.add_argument("--write-report", action="store_true")
+    drift_parser.add_argument("--json", action="store_true", help="Render machine-readable drift review output")
+    drift_parser.add_argument("--dry-run", action="store_true")
+    drift_parser.set_defaults(func=cmd_drift_review)
+
+    reindex_parser = subparsers.add_parser("reindex", aliases=["update-index"], help="Check or sync wiki/index.md against canonical pages")
+    reindex_parser.add_argument("--write", action="store_true", help="Insert missing canonical entries into wiki/index.md")
+    reindex_parser.add_argument("--prune", action="store_true", help="Remove stale canonical entries from wiki/index.md")
+    reindex_parser.add_argument("--dry-run", action="store_true")
+    reindex_parser.set_defaults(func=cmd_reindex)
+
+    delete_parser = subparsers.add_parser("delete", aliases=["remove"], help="Move a page to trash and remove its index entry")
+    delete_parser.add_argument("path", help="Repo-relative path to the file to delete")
+    delete_parser.add_argument("--with-raw", action="store_true", help="Also trash raw files referenced by source_refs")
+    delete_parser.add_argument("--write-log", action="store_true", help="Also append a default structured log entry after deletion")
+    delete_parser.add_argument("--dry-run", action="store_true")
+    delete_parser.set_defaults(func=cmd_delete)
+
+    distill_parser = subparsers.add_parser("distill-memory", aliases=["distill", "promote-memory"], help="Distill stable facts into workspace memory candidates and refresh memory")
+    distill_parser.add_argument("pages", nargs="*", help="Repo-relative canonical pages to distill")
+    distill_parser.add_argument("--fact", action="append", help="Manual stable fact to distill")
+    distill_parser.add_argument("--limit", type=int, default=3, help="Max extracted facts per page")
+    distill_parser.add_argument("--workspace-only", action="store_true", help="Do not mark the takeaway as cross-project/global")
+    distill_parser.add_argument("--no-refresh", action="store_true", help="Write candidate files but skip refresh_memory.py")
+    distill_parser.add_argument("--dry-run", action="store_true")
+    distill_parser.set_defaults(func=cmd_distill_memory)
+
+    return parser
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

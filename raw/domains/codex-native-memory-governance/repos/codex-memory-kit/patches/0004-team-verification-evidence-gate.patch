@@ -1,0 +1,489 @@
+From 8b89da5ef2da621e6742cf209132225210f01fbe Mon Sep 17 00:00:00 2001
+From: redacted <redacted@example.invalid>
+Date: Sat, 4 Apr 2026 22:59:22 +0800
+Subject: [PATCH] feat: gate team refresh on verification evidence
+
+---
+ src/team/__tests__/runtime-cli.test.ts | 101 +++++++++++++++++++++++--
+ src/team/__tests__/runtime.test.ts     |  10 +++
+ src/team/runtime-cli.ts                |  62 ++++++++++++++-
+ src/team/runtime.ts                    |  19 +++++
+ src/team/state.ts                      |  69 +++++++++++++++++
+ src/team/team-ops.ts                   |   3 +
+ 6 files changed, 256 insertions(+), 8 deletions(-)
+
+diff --git a/src/team/__tests__/runtime-cli.test.ts b/src/team/__tests__/runtime-cli.test.ts
+index 9b6849f..7c71a4a 100644
+--- a/src/team/__tests__/runtime-cli.test.ts
++++ b/src/team/__tests__/runtime-cli.test.ts
+@@ -5,7 +5,14 @@ import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises';
+ import { tmpdir } from 'os';
+ import { join } from 'path';
+ 
+-import { initTeamState, createTask, readTeamConfig, saveTeamConfig } from '../state.js';
++import {
++  initTeamState,
++  createTask,
++  readTeamConfig,
++  saveTeamConfig,
++  writeTeamVerification,
++  type TeamVerificationState,
++} from '../state.js';
+ 
+ async function loadRuntimeCliModule() {
+   process.env.OMX_RUNTIME_CLI_DISABLE_AUTO_START = '1';
+@@ -26,6 +33,20 @@ async function createRefreshFixture(): Promise<{
+   return { root, memoryRoot, scriptPath };
+ }
+ 
++function buildVerificationState(
++  overrides: Partial<TeamVerificationState> = {},
++): TeamVerificationState {
++  return {
++    status: 'verified',
++    phase: 'complete',
++    completed_code_task_ids: ['task-1'],
++    verified_task_ids: ['task-1'],
++    pending_task_ids: [],
++    updated_at: new Date().toISOString(),
++    ...overrides,
++  };
++}
++
+ describe('runtime-cli helpers', () => {
+   it('normalizes per-worker providers and validates supported values', async () => {
+     const runtimeCli = await loadRuntimeCliModule();
+@@ -154,19 +175,48 @@ describe('runtime-cli helpers', () => {
+ 
+   it('keeps team-complete refresh disabled until strict mode and explicit team gate are enabled', async () => {
+     const runtimeCli = await loadRuntimeCliModule();
++    const verificationState = buildVerificationState();
+ 
+-    const disabledStrict = runtimeCli.scheduleFormalMemoryRefreshOnTeamComplete('/repo', 'alpha', {});
++    const disabledStrict = runtimeCli.scheduleFormalMemoryRefreshOnTeamComplete('/repo', 'alpha', {}, undefined, verificationState);
+     assert.equal(disabledStrict.scheduled, false);
+     assert.equal(disabledStrict.reason, 'strict_mode_disabled');
+ 
+     const disabledGate = runtimeCli.scheduleFormalMemoryRefreshOnTeamComplete('/repo', 'alpha', {
+       OMX_STRICT_MEMORY_MODE: '1',
+-    });
++    }, undefined, verificationState);
+     assert.equal(disabledGate.scheduled, false);
+     assert.equal(disabledGate.reason, 'team_completion_refresh_disabled');
+   });
+ 
+-  it('schedules detached formal-memory refresh for completed leader teams', async () => {
++  it('blocks team-complete refresh until verification evidence is marked complete and verified', async () => {
++    const runtimeCli = await loadRuntimeCliModule();
++    const fixture = await createRefreshFixture();
++    try {
++      const baseEnv = {
++        OMX_STRICT_MEMORY_MODE: '1',
++        OMX_STRICT_MEMORY_REFRESH_ON_TEAM_COMPLETE: '1',
++        OMX_EXTERNAL_MEMORY_ROOT: fixture.memoryRoot,
++      };
++
++      const missing = runtimeCli.scheduleFormalMemoryRefreshOnTeamComplete('/repo', 'team-alpha', baseEnv);
++      assert.equal(missing.scheduled, false);
++      assert.equal(missing.reason, 'team_verification_state_missing');
++
++      const pending = runtimeCli.scheduleFormalMemoryRefreshOnTeamComplete(
++        '/repo',
++        'team-alpha',
++        baseEnv,
++        undefined,
++        buildVerificationState({ status: 'pending', phase: 'team-verify', pending_task_ids: ['task-1'] }),
++      );
++      assert.equal(pending.scheduled, false);
++      assert.equal(pending.reason, 'team_verification_phase_incomplete');
++    } finally {
++      await rm(fixture.root, { recursive: true, force: true });
++    }
++  });
++
++  it('schedules detached formal-memory refresh for completed leader teams with verified evidence', async () => {
+     const runtimeCli = await loadRuntimeCliModule();
+     const fixture = await createRefreshFixture();
+     try {
+@@ -206,6 +256,7 @@ describe('runtime-cli helpers', () => {
+             },
+           };
+         }) as never,
++        buildVerificationState(),
+       );
+ 
+       assert.equal(result.scheduled, true);
+@@ -229,11 +280,51 @@ describe('runtime-cli helpers', () => {
+         OMX_STRICT_MEMORY_REFRESH_ON_TEAM_COMPLETE: '1',
+         OMX_EXTERNAL_MEMORY_ROOT: fixture.memoryRoot,
+         OMX_TEAM_WORKER: 'team-worker/worker-1',
+-      });
++      }, undefined, buildVerificationState());
+       assert.equal(result.scheduled, false);
+       assert.equal(result.reason, 'team_worker_process');
+     } finally {
+       await rm(fixture.root, { recursive: true, force: true });
+     }
+   });
++
++  it('can pre-read verified team state before shutdown cleanup and still schedule refresh', async () => {
++    const runtimeCli = await loadRuntimeCliModule();
++    const fixture = await createRefreshFixture();
++    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-cli-verify-state-'));
++    try {
++      await initTeamState('verified-refresh', 'task', 'executor', 1, cwd);
++      await writeTeamVerification('verified-refresh', buildVerificationState({
++        completed_code_task_ids: ['task-42'],
++        verified_task_ids: ['task-42'],
++      }), cwd);
++
++      let capturedCommand: string | undefined;
++      const verificationState = buildVerificationState({
++        completed_code_task_ids: ['task-42'],
++        verified_task_ids: ['task-42'],
++      });
++
++      const result = runtimeCli.scheduleFormalMemoryRefreshOnTeamComplete(
++        cwd,
++        'verified-refresh',
++        {
++          OMX_STRICT_MEMORY_MODE: '1',
++          OMX_STRICT_MEMORY_REFRESH_ON_TEAM_COMPLETE: '1',
++          OMX_EXTERNAL_MEMORY_ROOT: fixture.memoryRoot,
++        },
++        ((command: string) => {
++          capturedCommand = command;
++          return { unref() {} };
++        }) as never,
++        verificationState,
++      );
++
++      assert.equal(result.scheduled, true);
++      assert.equal(capturedCommand, 'python3');
++    } finally {
++      await rm(cwd, { recursive: true, force: true });
++      await rm(fixture.root, { recursive: true, force: true });
++    }
++  });
+ });
+diff --git a/src/team/__tests__/runtime.test.ts b/src/team/__tests__/runtime.test.ts
+index 4d3b4c3..a9e2e28 100644
+--- a/src/team/__tests__/runtime.test.ts
++++ b/src/team/__tests__/runtime.test.ts
+@@ -18,6 +18,7 @@ import {
+   writeAtomic,
+   readTask,
+   readMonitorSnapshot,
++  readTeamVerification,
+   claimTask,
+   transitionTaskStatus,
+   writeWorkerStatus,
+@@ -1793,6 +1794,10 @@ process.on('SIGTERM', () => {
+         first?.recommendations.some((r) => r.includes(`task-${task.id}`) && r.includes('Verification evidence missing')),
+         true,
+       );
++      const firstVerification = await readTeamVerification('team-verify-gate', cwd);
++      assert.equal(firstVerification?.status, 'pending');
++      assert.equal(firstVerification?.phase, 'team-verify');
++      assert.deepEqual(firstVerification?.pending_task_ids, [task.id]);
+ 
+       const taskPath = join(cwd, '.omx', 'state', 'team', 'team-verify-gate', 'tasks', `task-${task.id}.json`);
+       const fromDisk = JSON.parse(await readFile(taskPath, 'utf-8')) as Record<string, unknown>;
+@@ -1807,6 +1812,11 @@ process.on('SIGTERM', () => {
+       const second = await monitorTeam('team-verify-gate', cwd);
+       assert.ok(second);
+       assert.equal(second?.phase, 'complete');
++      const secondVerification = await readTeamVerification('team-verify-gate', cwd);
++      assert.equal(secondVerification?.status, 'verified');
++      assert.equal(secondVerification?.phase, 'complete');
++      assert.deepEqual(secondVerification?.verified_task_ids, [task.id]);
++      assert.deepEqual(secondVerification?.pending_task_ids, []);
+     } finally {
+       if (typeof prevTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = prevTeamStateRoot;
+       else delete process.env.OMX_TEAM_STATE_ROOT;
+diff --git a/src/team/runtime-cli.ts b/src/team/runtime-cli.ts
+index 9379a4e..7eb1064 100644
+--- a/src/team/runtime-cli.ts
++++ b/src/team/runtime-cli.ts
+@@ -10,6 +10,7 @@ import { readdirSync, readFileSync } from 'fs';
+ import { writeFile, rename } from 'fs/promises';
+ import { join } from 'path';
+ import {
++  resolveFormalMemoryRefreshPlan,
+   scheduleFormalMemoryRefresh,
+   STRICT_MEMORY_REFRESH_ON_TEAM_COMPLETE_ENV,
+   type FormalMemoryRefreshScheduleResult,
+@@ -17,7 +18,11 @@ import {
+ } from '../integration/formal-memory-refresh.js';
+ import { startTeam, monitorTeam, shutdownTeam } from './runtime.js';
+ import type { TeamRuntime } from './runtime.js';
+-import { teamReadConfig as readTeamConfig } from './team-ops.js';
++import {
++  teamReadConfig as readTeamConfig,
++  teamReadVerification as readTeamVerificationState,
++  type TeamVerificationState,
++} from './team-ops.js';
+ 
+ interface CliInput {
+   teamName: string;
+@@ -88,18 +93,58 @@ export async function shutdownWithForceFallback(teamName: string, cwd: string):
+   }
+ }
+ 
++export function evaluateTeamVerificationRefreshGate(
++  verificationState: TeamVerificationState | null | undefined,
++): { allowed: boolean; reason: string } {
++  if (!verificationState) {
++    return { allowed: false, reason: 'team_verification_state_missing' };
++  }
++  if (verificationState.phase !== 'complete') {
++    return { allowed: false, reason: 'team_verification_phase_incomplete' };
++  }
++  if (verificationState.status === 'verified') {
++    return { allowed: true, reason: 'team_verification_verified' };
++  }
++  return {
++    allowed: false,
++    reason: verificationState.status === 'failed'
++      ? 'team_verification_failed'
++      : 'team_verification_pending',
++  };
++}
++
+ export function scheduleFormalMemoryRefreshOnTeamComplete(
+   cwd: string,
+   teamName: string,
+   env: NodeJS.ProcessEnv = process.env,
+   spawnImpl?: FormalMemoryRefreshSpawn,
++  verificationState?: TeamVerificationState | null,
+ ): FormalMemoryRefreshScheduleResult {
+-  return scheduleFormalMemoryRefresh({
++  const refreshTarget = {
+     cwd,
+     source: 'omx-team-runtime-complete',
+     teamName,
+     enableEnvKeys: [STRICT_MEMORY_REFRESH_ON_TEAM_COMPLETE_ENV],
+     disabledReason: 'team_completion_refresh_disabled',
++  } as const;
++  const plan = resolveFormalMemoryRefreshPlan(refreshTarget, env);
++  if (!plan.enabled) {
++    return {
++      scheduled: false,
++      reason: plan.reason,
++      plan,
++    };
++  }
++  const gate = evaluateTeamVerificationRefreshGate(verificationState);
++  if (!gate.allowed) {
++    return {
++      scheduled: false,
++      reason: gate.reason,
++      plan,
++    };
++  }
++  return scheduleFormalMemoryRefresh({
++    ...refreshTarget,
+   }, env, spawnImpl);
+ }
+ 
+@@ -201,9 +246,13 @@ async function main(): Promise<void> {
+   async function doShutdown(status: 'completed' | 'failed'): Promise<void> {
+     pollActive = false;
+     finalStatus = status;
++    const teamCwd = runtime?.cwd ?? cwd;
+ 
+     // 1. Collect task results
+     const taskResults = collectTaskResults(stateRoot, teamName);
++    const verificationState = status === 'completed'
++      ? await readTeamVerificationState(teamName, teamCwd)
++      : null;
+ 
+     // 2. Shutdown team
+     if (runtime) {
+@@ -221,9 +270,16 @@ async function main(): Promise<void> {
+ 
+     if (status === 'completed') {
+       try {
+-        const refresh = scheduleFormalMemoryRefreshOnTeamComplete(runtime?.cwd ?? cwd, teamName);
++        const refresh = scheduleFormalMemoryRefreshOnTeamComplete(
++          teamCwd,
++          teamName,
++          process.env,
++          undefined,
++          verificationState,
++        );
+         if (!refresh.scheduled && (
+           refresh.reason === 'refresh_script_unavailable'
++          || refresh.reason.startsWith('team_verification_')
+           || refresh.reason.startsWith('spawn_failed:')
+         )) {
+           process.stderr.write(
+diff --git a/src/team/runtime.ts b/src/team/runtime.ts
+index 9697084..f52949a 100644
+--- a/src/team/runtime.ts
++++ b/src/team/runtime.ts
+@@ -61,6 +61,7 @@ import {
+   teamWriteMonitorSnapshot as writeMonitorSnapshot,
+   teamReadPhase as readTeamPhaseState,
+   teamWritePhase as writeTeamPhaseState,
++  teamWriteVerification as writeTeamVerificationState,
+   type TeamConfig,
+   type WorkerInfo,
+   type WorkerHeartbeat,
+@@ -68,6 +69,7 @@ import {
+   type TeamTask,
+   type TeamMonitorSnapshotState,
+   type TeamPhaseState,
++  type TeamVerificationState,
+   type TeamWorkerIntegrationState,
+   type TeamGovernance,
+   type TeamPolicy,
+@@ -1942,6 +1944,23 @@ export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSn
+   const phaseState: TeamPhaseState = reconcilePhaseStateForMonitor(persistedPhase, targetPhase);
+   await writeTeamPhaseState(sanitized, phaseState, cwd);
+   const phase: TeamPhase | TerminalPhase = phaseState.current_phase;
++  const completedCodeTasks = taskView.filter(
++    (task) => task.status === 'completed' && task.requires_code_change === true,
++  );
++  const verifiedCodeTasks = completedCodeTasks.filter((task) => hasStructuredVerificationEvidence(task.result));
++  const verificationState: TeamVerificationState = {
++    status: phase === 'failed'
++      ? 'failed'
++      : allTasksTerminal && verificationPendingTasks.length === 0
++        ? 'verified'
++        : 'pending',
++    phase,
++    completed_code_task_ids: completedCodeTasks.map((task) => task.id),
++    verified_task_ids: verifiedCodeTasks.map((task) => task.id),
++    pending_task_ids: verificationPendingTasks.map((task) => task.id),
++    updated_at: new Date().toISOString(),
++  };
++  await writeTeamVerificationState(sanitized, verificationState, cwd);
+   await syncRootTeamModeStateOnTerminalPhase(sanitized, phase, cwd);
+ 
+   if (deadWorkerStall) {
+diff --git a/src/team/state.ts b/src/team/state.ts
+index 735d654..ce052c5 100644
+--- a/src/team/state.ts
++++ b/src/team/state.ts
+@@ -790,6 +790,18 @@ export async function initTeamState(
+     },
+     cwd
+   );
++  await writeTeamVerification(
++    teamName,
++    {
++      status: 'pending',
++      phase: 'team-exec',
++      completed_code_task_ids: [],
++      verified_task_ids: [],
++      pending_task_ids: [],
++      updated_at: new Date().toISOString(),
++    },
++    cwd,
++  );
+   await writeTeamManifestV2(
+     {
+       schema_version: 2,
+@@ -1747,6 +1759,15 @@ export interface TeamPhaseState {
+   updated_at: string;
+ }
+ 
++export interface TeamVerificationState {
++  status: 'pending' | 'verified' | 'failed';
++  phase: TeamPhase | TerminalPhase;
++  completed_code_task_ids: string[];
++  verified_task_ids: string[];
++  pending_task_ids: string[];
++  updated_at: string;
++}
++
+ function teamPhasePath(teamName: string, cwd: string): string {
+   return join(teamDir(teamName, cwd), 'phase.json');
+ }
+@@ -1755,6 +1776,10 @@ function monitorSnapshotPath(teamName: string, cwd: string): string {
+   return join(teamDir(teamName, cwd), 'monitor-snapshot.json');
+ }
+ 
++function verificationStatePath(teamName: string, cwd: string): string {
++  return join(teamDir(teamName, cwd), 'verification-state.json');
++}
++
+ export async function readMonitorSnapshot(
+   teamName: string,
+   cwd: string,
+@@ -1770,6 +1795,50 @@ export async function writeMonitorSnapshot(
+   await writeMonitorSnapshotImpl(teamName, snapshot, cwd, monitorSnapshotPath, writeAtomic);
+ }
+ 
++export async function readTeamVerification(
++  teamName: string,
++  cwd: string,
++): Promise<TeamVerificationState | null> {
++  try {
++    const raw = await readFile(verificationStatePath(teamName, cwd), 'utf-8');
++    const parsed = JSON.parse(raw) as TeamVerificationState;
++    if (parsed.status !== 'pending' && parsed.status !== 'verified' && parsed.status !== 'failed') {
++      return null;
++    }
++    if (
++      parsed.phase !== 'team-exec'
++      && parsed.phase !== 'team-verify'
++      && parsed.phase !== 'team-fix'
++      && parsed.phase !== 'complete'
++      && parsed.phase !== 'failed'
++    ) {
++      return null;
++    }
++    return {
++      status: parsed.status,
++      phase: parsed.phase,
++      completed_code_task_ids: Array.isArray(parsed.completed_code_task_ids) ? parsed.completed_code_task_ids : [],
++      verified_task_ids: Array.isArray(parsed.verified_task_ids) ? parsed.verified_task_ids : [],
++      pending_task_ids: Array.isArray(parsed.pending_task_ids) ? parsed.pending_task_ids : [],
++      updated_at: typeof parsed.updated_at === 'string' ? parsed.updated_at : new Date().toISOString(),
++    };
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
++    return null;
++  }
++}
++
++export async function writeTeamVerification(
++  teamName: string,
++  verificationState: TeamVerificationState,
++  cwd: string,
++): Promise<void> {
++  await writeAtomic(
++    verificationStatePath(teamName, cwd),
++    JSON.stringify(verificationState, null, 2),
++  );
++}
++
+ export async function readTeamPhase(
+   teamName: string,
+   cwd: string,
+diff --git a/src/team/team-ops.ts b/src/team/team-ops.ts
+index 24fecd0..34995ad 100644
+--- a/src/team/team-ops.ts
++++ b/src/team/team-ops.ts
+@@ -43,6 +43,7 @@ export type {
+   TeamMonitorSnapshotState,
+   TeamWorkerIntegrationState,
+   TeamPhaseState,
++  TeamVerificationState,
+ } from './state.js';
+ 
+ // === Constants ===
+@@ -109,6 +110,8 @@ export { readMonitorSnapshot as teamReadMonitorSnapshot } from './state.js';
+ export { writeMonitorSnapshot as teamWriteMonitorSnapshot } from './state.js';
+ export { readTeamPhase as teamReadPhase } from './state.js';
+ export { writeTeamPhase as teamWritePhase } from './state.js';
++export { readTeamVerification as teamReadVerification } from './state.js';
++export { writeTeamVerification as teamWriteVerification } from './state.js';
+ 
+ // === Worker status write ===
+ export { writeWorkerStatus as teamWriteWorkerStatus } from './state.js';
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,616 @@
+From 5586da08c85348a2ea9f52d97e4993187faeff37 Mon Sep 17 00:00:00 2001
+From: redacted <redacted@example.invalid>
+Date: Sat, 4 Apr 2026 20:48:06 +0800
+Subject: [PATCH] feat: refresh strict memory when teams complete
+
+---
+ src/cli/index.ts                         | 161 ++++----------------
+ src/integration/formal-memory-refresh.ts | 180 +++++++++++++++++++++++
+ src/team/__tests__/runtime-cli.test.ts   | 113 +++++++++++++-
+ src/team/runtime-cli.ts                  |  37 +++++
+ 4 files changed, 348 insertions(+), 143 deletions(-)
+ create mode 100644 src/integration/formal-memory-refresh.ts
+
+diff --git a/src/cli/index.ts b/src/cli/index.ts
+index 576f1e6..7ae59d4 100644
+--- a/src/cli/index.ts
++++ b/src/cli/index.ts
+@@ -4,7 +4,7 @@
+  */
+ 
+ import { execFileSync, spawn } from "child_process";
+-import { basename, dirname, join, resolve } from "path";
++import { basename, dirname, join } from "path";
+ import { existsSync, readFileSync } from "fs";
+ import { constants as osConstants } from "os";
+ import { setup, SETUP_SCOPES, type SetupScope } from "./setup.js";
+@@ -94,6 +94,15 @@ import {
+   type NotifyTempContract,
+   type ParseNotifyTempContractResult,
+ } from "../notifications/temp-contract.js";
++import {
++  scheduleFormalMemoryRefresh,
++  resolveFormalMemoryRefreshPlan as resolveSharedFormalMemoryRefreshPlan,
++  resolveFormalMemoryRefreshScript as resolveSharedFormalMemoryRefreshScript,
++  STRICT_MEMORY_REFRESH_ON_EXIT_ENV,
++  type FormalMemoryRefreshPlan,
++  type FormalMemoryRefreshScheduleResult,
++  type FormalMemoryRefreshSpawn,
++} from "../integration/formal-memory-refresh.js";
+ 
+ export function resolveNotifyFallbackWatcherScript(pkgRoot = getPackageRoot()): string {
+   return join(pkgRoot, "dist", "scripts", "notify-fallback-watcher.js");
+@@ -179,66 +188,11 @@ const REASONING_KEY = "model_reasoning_effort";
+ const MODEL_INSTRUCTIONS_FILE_KEY = "model_instructions_file";
+ const TEAM_WORKER_LAUNCH_ARGS_ENV = "OMX_TEAM_WORKER_LAUNCH_ARGS";
+ const TEAM_INHERIT_LEADER_FLAGS_ENV = "OMX_TEAM_INHERIT_LEADER_FLAGS";
+-const STRICT_MEMORY_MODE_ENV = "OMX_STRICT_MEMORY_MODE";
+-const STRICT_MEMORY_REFRESH_ON_EXIT_ENV = "OMX_STRICT_MEMORY_REFRESH_ON_EXIT";
+-const EXTERNAL_MEMORY_ROOT_ENV = "OMX_EXTERNAL_MEMORY_ROOT";
+-const EXTERNAL_MEMORY_REFRESH_SCRIPT_ENV = "OMX_EXTERNAL_MEMORY_REFRESH_SCRIPT";
+-const EXTERNAL_MEMORY_REFRESH_PYTHON_ENV = "OMX_EXTERNAL_MEMORY_REFRESH_PYTHON";
+-const TEAM_WORKER_ENV = "OMX_TEAM_WORKER";
+-
+-export interface FormalMemoryRefreshPlan {
+-  enabled: boolean;
+-  strictMode: boolean;
+-  reason:
+-    | "strict_mode_disabled"
+-    | "refresh_on_exit_disabled"
+-    | "team_worker_process"
+-    | "refresh_script_unavailable"
+-    | "enabled";
+-  scriptPath?: string;
+-  command?: string;
+-  args?: string[];
+-  childEnv?: NodeJS.ProcessEnv;
+-}
+-
+-export interface FormalMemoryRefreshScheduleResult {
+-  scheduled: boolean;
+-  reason: string;
+-  plan: FormalMemoryRefreshPlan;
+-}
+-
+-type FormalMemoryRefreshSpawn = (
+-  command: string,
+-  args: readonly string[],
+-  options: {
+-    cwd: string;
+-    env: NodeJS.ProcessEnv;
+-    detached: boolean;
+-    stdio: "ignore";
+-  },
+-) => {
+-  unref?: () => void;
+-};
+-
+-function parseOptionalBooleanEnv(value: string | undefined): boolean | undefined {
+-  if (typeof value !== "string") return undefined;
+-  const normalized = value.trim().toLowerCase();
+-  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+-  if (["0", "false", "no", "off"].includes(normalized)) return false;
+-  return undefined;
+-}
+ 
+ export function resolveFormalMemoryRefreshScript(
+   env: NodeJS.ProcessEnv = process.env,
+ ): string | null {
+-  const explicit = env[EXTERNAL_MEMORY_REFRESH_SCRIPT_ENV]?.trim();
+-  if (explicit) return explicit;
+-
+-  const memoryRoot = env[EXTERNAL_MEMORY_ROOT_ENV]?.trim();
+-  if (!memoryRoot) return null;
+-
+-  const candidate = join(dirname(resolve(memoryRoot)), "scripts", "refresh_memory.py");
+-  return existsSync(candidate) ? candidate : null;
++  return resolveSharedFormalMemoryRefreshScript(env);
+ }
+ 
+ export function resolveFormalMemoryRefreshPlan(
+@@ -246,55 +200,13 @@ export function resolveFormalMemoryRefreshPlan(
+   sessionId: string,
+   env: NodeJS.ProcessEnv = process.env,
+ ): FormalMemoryRefreshPlan {
+-  const strictMode = parseOptionalBooleanEnv(env[STRICT_MEMORY_MODE_ENV]) === true;
+-  if (!strictMode) {
+-    return {
+-      enabled: false,
+-      strictMode,
+-      reason: "strict_mode_disabled",
+-    };
+-  }
+-
+-  if (parseOptionalBooleanEnv(env[STRICT_MEMORY_REFRESH_ON_EXIT_ENV]) !== true) {
+-    return {
+-      enabled: false,
+-      strictMode,
+-      reason: "refresh_on_exit_disabled",
+-    };
+-  }
+-
+-  if (typeof env[TEAM_WORKER_ENV] === "string" && env[TEAM_WORKER_ENV].trim() !== "") {
+-    return {
+-      enabled: false,
+-      strictMode,
+-      reason: "team_worker_process",
+-    };
+-  }
+-
+-  const scriptPath = resolveFormalMemoryRefreshScript(env);
+-  if (!scriptPath) {
+-    return {
+-      enabled: false,
+-      strictMode,
+-      reason: "refresh_script_unavailable",
+-    };
+-  }
+-
+-  const command = env[EXTERNAL_MEMORY_REFRESH_PYTHON_ENV]?.trim() || "python3";
+-  return {
+-    enabled: true,
+-    strictMode,
+-    reason: "enabled",
+-    scriptPath,
+-    command,
+-    args: [scriptPath, "--workspace-root", cwd],
+-    childEnv: {
+-      ...process.env,
+-      ...env,
+-      OMX_EXTERNAL_MEMORY_REFRESH_SOURCE: "omx-postlaunch",
+-      OMX_EXTERNAL_MEMORY_REFRESH_SESSION_ID: sessionId,
+-    },
+-  };
++  return resolveSharedFormalMemoryRefreshPlan({
++    cwd,
++    source: "omx-postlaunch",
++    sessionId,
++    enableEnvKeys: [STRICT_MEMORY_REFRESH_ON_EXIT_ENV],
++    disabledReason: "refresh_on_exit_disabled",
++  }, env);
+ }
+ 
+ export function scheduleFormalMemoryRefreshOnExit(
+@@ -303,36 +215,13 @@ export function scheduleFormalMemoryRefreshOnExit(
+   env: NodeJS.ProcessEnv = process.env,
+   spawnImpl: FormalMemoryRefreshSpawn = spawn,
+ ): FormalMemoryRefreshScheduleResult {
+-  const plan = resolveFormalMemoryRefreshPlan(cwd, sessionId, env);
+-  if (!plan.enabled || !plan.command || !plan.args || !plan.childEnv) {
+-    return {
+-      scheduled: false,
+-      reason: plan.reason,
+-      plan,
+-    };
+-  }
+-
+-  try {
+-    const child = spawnImpl(plan.command, plan.args, {
+-      cwd,
+-      env: plan.childEnv,
+-      detached: true,
+-      stdio: "ignore",
+-    });
+-    child.unref?.();
+-    return {
+-      scheduled: true,
+-      reason: "scheduled",
+-      plan,
+-    };
+-  } catch (error) {
+-    const message = error instanceof Error ? error.message : String(error);
+-    return {
+-      scheduled: false,
+-      reason: `spawn_failed:${message}`,
+-      plan,
+-    };
+-  }
++  return scheduleFormalMemoryRefresh({
++    cwd,
++    source: "omx-postlaunch",
++    sessionId,
++    enableEnvKeys: [STRICT_MEMORY_REFRESH_ON_EXIT_ENV],
++    disabledReason: "refresh_on_exit_disabled",
++  }, env, spawnImpl);
+ }
+ const OMX_BYPASS_DEFAULT_SYSTEM_PROMPT_ENV = "OMX_BYPASS_DEFAULT_SYSTEM_PROMPT";
+ const OMX_MODEL_INSTRUCTIONS_FILE_ENV = "OMX_MODEL_INSTRUCTIONS_FILE";
+diff --git a/src/integration/formal-memory-refresh.ts b/src/integration/formal-memory-refresh.ts
+new file mode 100644
+index 0000000..b765ea6
+--- /dev/null
++++ b/src/integration/formal-memory-refresh.ts
+@@ -0,0 +1,180 @@
++import { spawn } from "child_process";
++import { existsSync } from "fs";
++import { dirname, join, resolve } from "path";
++
++export const STRICT_MEMORY_MODE_ENV = "OMX_STRICT_MEMORY_MODE";
++export const STRICT_MEMORY_REFRESH_ON_EXIT_ENV = "OMX_STRICT_MEMORY_REFRESH_ON_EXIT";
++export const STRICT_MEMORY_REFRESH_ON_TEAM_COMPLETE_ENV =
++  "OMX_STRICT_MEMORY_REFRESH_ON_TEAM_COMPLETE";
++export const EXTERNAL_MEMORY_ROOT_ENV = "OMX_EXTERNAL_MEMORY_ROOT";
++export const EXTERNAL_MEMORY_REFRESH_SCRIPT_ENV = "OMX_EXTERNAL_MEMORY_REFRESH_SCRIPT";
++export const EXTERNAL_MEMORY_REFRESH_PYTHON_ENV = "OMX_EXTERNAL_MEMORY_REFRESH_PYTHON";
++export const TEAM_WORKER_ENV = "OMX_TEAM_WORKER";
++
++export interface FormalMemoryRefreshPlan {
++  enabled: boolean;
++  strictMode: boolean;
++  reason: string;
++  scriptPath?: string;
++  command?: string;
++  args?: string[];
++  childEnv?: NodeJS.ProcessEnv;
++}
++
++export interface FormalMemoryRefreshScheduleResult {
++  scheduled: boolean;
++  reason: string;
++  plan: FormalMemoryRefreshPlan;
++}
++
++export interface FormalMemoryRefreshTarget {
++  cwd: string;
++  source: string;
++  enableEnvKeys: readonly string[];
++  disabledReason: string;
++  sessionId?: string;
++  teamName?: string;
++  skipTeamWorker?: boolean;
++}
++
++export type FormalMemoryRefreshSpawn = (
++  command: string,
++  args: readonly string[],
++  options: {
++    cwd: string;
++    env: NodeJS.ProcessEnv;
++    detached: boolean;
++    stdio: "ignore";
++  },
++) => {
++  unref?: () => void;
++};
++
++function parseOptionalBooleanEnv(value: string | undefined): boolean | undefined {
++  if (typeof value !== "string") return undefined;
++  const normalized = value.trim().toLowerCase();
++  if (["1", "true", "yes", "on"].includes(normalized)) return true;
++  if (["0", "false", "no", "off"].includes(normalized)) return false;
++  return undefined;
++}
++
++function isRefreshEnabled(
++  envKeys: readonly string[],
++  env: NodeJS.ProcessEnv,
++): boolean {
++  return envKeys.some((key) => parseOptionalBooleanEnv(env[key]) === true);
++}
++
++export function resolveFormalMemoryRefreshScript(
++  env: NodeJS.ProcessEnv = process.env,
++): string | null {
++  const explicit = env[EXTERNAL_MEMORY_REFRESH_SCRIPT_ENV]?.trim();
++  if (explicit) return explicit;
++
++  const memoryRoot = env[EXTERNAL_MEMORY_ROOT_ENV]?.trim();
++  if (!memoryRoot) return null;
++
++  const candidate = join(dirname(resolve(memoryRoot)), "scripts", "refresh_memory.py");
++  return existsSync(candidate) ? candidate : null;
++}
++
++export function resolveFormalMemoryRefreshPlan(
++  target: FormalMemoryRefreshTarget,
++  env: NodeJS.ProcessEnv = process.env,
++): FormalMemoryRefreshPlan {
++  const strictMode = parseOptionalBooleanEnv(env[STRICT_MEMORY_MODE_ENV]) === true;
++  if (!strictMode) {
++    return {
++      enabled: false,
++      strictMode,
++      reason: "strict_mode_disabled",
++    };
++  }
++
++  if (!isRefreshEnabled(target.enableEnvKeys, env)) {
++    return {
++      enabled: false,
++      strictMode,
++      reason: target.disabledReason,
++    };
++  }
++
++  if (
++    target.skipTeamWorker !== false
++    && typeof env[TEAM_WORKER_ENV] === "string"
++    && env[TEAM_WORKER_ENV].trim() !== ""
++  ) {
++    return {
++      enabled: false,
++      strictMode,
++      reason: "team_worker_process",
++    };
++  }
++
++  const scriptPath = resolveFormalMemoryRefreshScript(env);
++  if (!scriptPath) {
++    return {
++      enabled: false,
++      strictMode,
++      reason: "refresh_script_unavailable",
++    };
++  }
++
++  const command = env[EXTERNAL_MEMORY_REFRESH_PYTHON_ENV]?.trim() || "python3";
++  return {
++    enabled: true,
++    strictMode,
++    reason: "enabled",
++    scriptPath,
++    command,
++    args: [scriptPath, "--workspace-root", target.cwd],
++    childEnv: {
++      ...process.env,
++      ...env,
++      OMX_EXTERNAL_MEMORY_REFRESH_SOURCE: target.source,
++      ...(target.sessionId
++        ? { OMX_EXTERNAL_MEMORY_REFRESH_SESSION_ID: target.sessionId }
++        : {}),
++      ...(target.teamName
++        ? { OMX_EXTERNAL_MEMORY_REFRESH_TEAM_NAME: target.teamName }
++        : {}),
++    },
++  };
++}
++
++export function scheduleFormalMemoryRefresh(
++  target: FormalMemoryRefreshTarget,
++  env: NodeJS.ProcessEnv = process.env,
++  spawnImpl: FormalMemoryRefreshSpawn = spawn,
++): FormalMemoryRefreshScheduleResult {
++  const plan = resolveFormalMemoryRefreshPlan(target, env);
++  if (!plan.enabled || !plan.command || !plan.args || !plan.childEnv) {
++    return {
++      scheduled: false,
++      reason: plan.reason,
++      plan,
++    };
++  }
++
++  try {
++    const child = spawnImpl(plan.command, plan.args, {
++      cwd: target.cwd,
++      env: plan.childEnv,
++      detached: true,
++      stdio: "ignore",
++    });
++    child.unref?.();
++    return {
++      scheduled: true,
++      reason: "scheduled",
++      plan,
++    };
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error);
++    return {
++      scheduled: false,
++      reason: `spawn_failed:${message}`,
++      plan,
++    };
++  }
++}
+diff --git a/src/team/__tests__/runtime-cli.test.ts b/src/team/__tests__/runtime-cli.test.ts
+index 77ed0cd..9b6849f 100644
+--- a/src/team/__tests__/runtime-cli.test.ts
++++ b/src/team/__tests__/runtime-cli.test.ts
+@@ -1,9 +1,10 @@
+ import { describe, it } from 'node:test';
+ import assert from 'node:assert/strict';
+-import { mkdtemp, rm } from 'fs/promises';
+ import { existsSync } from 'fs';
+-import { join } from 'path';
++import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises';
+ import { tmpdir } from 'os';
++import { join } from 'path';
++
+ import { initTeamState, createTask, readTeamConfig, saveTeamConfig } from '../state.js';
+ 
+ async function loadRuntimeCliModule() {
+@@ -11,6 +12,20 @@ async function loadRuntimeCliModule() {
+   return await import('../runtime-cli.js');
+ }
+ 
++async function createRefreshFixture(): Promise<{
++  root: string;
++  memoryRoot: string;
++  scriptPath: string;
++}> {
++  const root = await mkdtemp(join(tmpdir(), 'omx-runtime-cli-refresh-'));
++  const memoryRoot = join(root, 'memory');
++  const scriptPath = join(root, 'scripts', 'refresh_memory.py');
++  await mkdir(memoryRoot, { recursive: true });
++  await mkdir(join(root, 'scripts'), { recursive: true });
++  await writeFile(scriptPath, '#!/usr/bin/env python3\n', 'utf-8');
++  return { root, memoryRoot, scriptPath };
++}
++
+ describe('runtime-cli helpers', () => {
+   it('normalizes per-worker providers and validates supported values', async () => {
+     const runtimeCli = await loadRuntimeCliModule();
+@@ -74,6 +89,14 @@ describe('runtime-cli helpers', () => {
+     assert.equal(liveBehavior.fixingWithNoWorkers, false);
+   });
+ 
++  it('does not treat leader pane as a worker pane for dead-worker detection', async () => {
++    const runtimeCli = await loadRuntimeCliModule();
++
++    const result = runtimeCli.detectDeadWorkerFailure(1, 1, true, 'team-exec');
++    assert.equal(result.deadWorkerFailure, true);
++    assert.equal(result.fixingWithNoWorkers, false);
++  });
++
+   it('gracefully shuts down only when the leader explicitly requests shutdown', async () => {
+     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-cli-shutdown-'));
+     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
+@@ -128,13 +151,89 @@ describe('runtime-cli helpers', () => {
+       await rm(cwd, { recursive: true, force: true });
+     }
+   });
+-});
+ 
++  it('keeps team-complete refresh disabled until strict mode and explicit team gate are enabled', async () => {
++    const runtimeCli = await loadRuntimeCliModule();
+ 
+-  it('does not treat leader pane as a worker pane for dead-worker detection', async () => {
++    const disabledStrict = runtimeCli.scheduleFormalMemoryRefreshOnTeamComplete('/repo', 'alpha', {});
++    assert.equal(disabledStrict.scheduled, false);
++    assert.equal(disabledStrict.reason, 'strict_mode_disabled');
++
++    const disabledGate = runtimeCli.scheduleFormalMemoryRefreshOnTeamComplete('/repo', 'alpha', {
++      OMX_STRICT_MEMORY_MODE: '1',
++    });
++    assert.equal(disabledGate.scheduled, false);
++    assert.equal(disabledGate.reason, 'team_completion_refresh_disabled');
++  });
++
++  it('schedules detached formal-memory refresh for completed leader teams', async () => {
+     const runtimeCli = await loadRuntimeCliModule();
++    const fixture = await createRefreshFixture();
++    try {
++      let captured:
++        | {
++            command: string;
++            args: readonly string[];
++            options: {
++              cwd: string;
++              env: NodeJS.ProcessEnv;
++              detached: boolean;
++              stdio: 'ignore';
++            };
++          }
++        | undefined;
++      let unrefCalled = false;
++
++      const result = runtimeCli.scheduleFormalMemoryRefreshOnTeamComplete(
++        '/repo',
++        'team-alpha',
++        {
++          OMX_STRICT_MEMORY_MODE: '1',
++          OMX_STRICT_MEMORY_REFRESH_ON_TEAM_COMPLETE: '1',
++          OMX_EXTERNAL_MEMORY_ROOT: fixture.memoryRoot,
++          OMX_EXTERNAL_MEMORY_REFRESH_PYTHON: 'python3.12',
++        },
++        ((command: string, args: readonly string[], options: {
++          cwd: string;
++          env: NodeJS.ProcessEnv;
++          detached: boolean;
++          stdio: 'ignore';
++        }) => {
++          captured = { command, args, options };
++          return {
++            unref() {
++              unrefCalled = true;
++            },
++          };
++        }) as never,
++      );
++
++      assert.equal(result.scheduled, true);
++      assert.equal(captured?.command, 'python3.12');
++      assert.deepEqual(captured?.args, [fixture.scriptPath, '--workspace-root', '/repo']);
++      assert.equal(captured?.options.env.OMX_EXTERNAL_MEMORY_REFRESH_SOURCE, 'omx-team-runtime-complete');
++      assert.equal(captured?.options.env.OMX_EXTERNAL_MEMORY_REFRESH_TEAM_NAME, 'team-alpha');
++      assert.equal(captured?.options.detached, true);
++      assert.equal(unrefCalled, true);
++    } finally {
++      await rm(fixture.root, { recursive: true, force: true });
++    }
++  });
+ 
+-    const result = runtimeCli.detectDeadWorkerFailure(1, 1, true, 'team-exec');
+-    assert.equal(result.deadWorkerFailure, true);
+-    assert.equal(result.fixingWithNoWorkers, false);
++  it('skips team-complete refresh when the process is marked as a team worker', async () => {
++    const runtimeCli = await loadRuntimeCliModule();
++    const fixture = await createRefreshFixture();
++    try {
++      const result = runtimeCli.scheduleFormalMemoryRefreshOnTeamComplete('/repo', 'team-worker', {
++        OMX_STRICT_MEMORY_MODE: '1',
++        OMX_STRICT_MEMORY_REFRESH_ON_TEAM_COMPLETE: '1',
++        OMX_EXTERNAL_MEMORY_ROOT: fixture.memoryRoot,
++        OMX_TEAM_WORKER: 'team-worker/worker-1',
++      });
++      assert.equal(result.scheduled, false);
++      assert.equal(result.reason, 'team_worker_process');
++    } finally {
++      await rm(fixture.root, { recursive: true, force: true });
++    }
+   });
++});
+diff --git a/src/team/runtime-cli.ts b/src/team/runtime-cli.ts
+index 28fcf23..9379a4e 100644
+--- a/src/team/runtime-cli.ts
++++ b/src/team/runtime-cli.ts
+@@ -9,6 +9,12 @@
+ import { readdirSync, readFileSync } from 'fs';
+ import { writeFile, rename } from 'fs/promises';
+ import { join } from 'path';
++import {
++  scheduleFormalMemoryRefresh,
++  STRICT_MEMORY_REFRESH_ON_TEAM_COMPLETE_ENV,
++  type FormalMemoryRefreshScheduleResult,
++  type FormalMemoryRefreshSpawn,
++} from '../integration/formal-memory-refresh.js';
+ import { startTeam, monitorTeam, shutdownTeam } from './runtime.js';
+ import type { TeamRuntime } from './runtime.js';
+ import { teamReadConfig as readTeamConfig } from './team-ops.js';
+@@ -82,6 +88,21 @@ export async function shutdownWithForceFallback(teamName: string, cwd: string):
+   }
+ }
+ 
++export function scheduleFormalMemoryRefreshOnTeamComplete(
++  cwd: string,
++  teamName: string,
++  env: NodeJS.ProcessEnv = process.env,
++  spawnImpl?: FormalMemoryRefreshSpawn,
++): FormalMemoryRefreshScheduleResult {
++  return scheduleFormalMemoryRefresh({
++    cwd,
++    source: 'omx-team-runtime-complete',
++    teamName,
++    enableEnvKeys: [STRICT_MEMORY_REFRESH_ON_TEAM_COMPLETE_ENV],
++    disabledReason: 'team_completion_refresh_disabled',
++  }, env, spawnImpl);
++}
++
+ export function detectDeadWorkerFailure(
+   deadWorkerCount: number,
+   liveWorkerPaneCount: number,
+@@ -198,6 +219,22 @@ async function main(): Promise<void> {
+       }
+     }
+ 
++    if (status === 'completed') {
++      try {
++        const refresh = scheduleFormalMemoryRefreshOnTeamComplete(runtime?.cwd ?? cwd, teamName);
++        if (!refresh.scheduled && (
++          refresh.reason === 'refresh_script_unavailable'
++          || refresh.reason.startsWith('spawn_failed:')
++        )) {
++          process.stderr.write(
++            `[runtime-cli] strict formal-memory refresh skipped: ${refresh.reason}\n`,
++          );
++        }
++      } catch (err) {
++        process.stderr.write(`[runtime-cli] strict formal-memory refresh error: ${err}\n`);
++      }
++    }
++
+     const duration = (Date.now() - startTime) / 1000;
+     const output: CliOutput = {
+       status: finalStatus,
+-- 
+2.50.1 (Apple Git-155)
+

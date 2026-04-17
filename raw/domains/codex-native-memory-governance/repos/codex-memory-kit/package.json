@@ -1,0 +1,10 @@
+{
+  "name": "codex-memory-kit",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Codex-native memory governance layer for formal memory, verification evidence, and promotion control.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

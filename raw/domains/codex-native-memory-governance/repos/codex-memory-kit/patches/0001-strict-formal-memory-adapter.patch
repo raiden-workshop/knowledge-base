@@ -1,0 +1,992 @@
+From f9c84a558a91d75450cf6813f6d5d2a0e71e9d5d Mon Sep 17 00:00:00 2001
+From: redacted <redacted@example.invalid>
+Date: Sat, 4 Apr 2026 19:09:41 +0800
+Subject: [PATCH] feat: integrate strict formal memory into memory server and
+ overlay
+
+---
+ src/hooks/__tests__/agents-overlay.test.ts    | 113 +++++++
+ src/hooks/agents-overlay.ts                   |  15 +-
+ .../__tests__/formal-memory.test.ts           | 141 +++++++++
+ src/integration/formal-memory.ts              | 278 ++++++++++++++++++
+ .../memory-server-strict-mode.test.ts         | 188 ++++++++++++
+ src/mcp/memory-server.ts                      |  86 +++++-
+ 6 files changed, 808 insertions(+), 13 deletions(-)
+ create mode 100644 src/integration/__tests__/formal-memory.test.ts
+ create mode 100644 src/integration/formal-memory.ts
+ create mode 100644 src/mcp/__tests__/memory-server-strict-mode.test.ts
+
+diff --git a/src/hooks/__tests__/agents-overlay.test.ts b/src/hooks/__tests__/agents-overlay.test.ts
+index 721c65a..bc968a9 100644
+--- a/src/hooks/__tests__/agents-overlay.test.ts
++++ b/src/hooks/__tests__/agents-overlay.test.ts
+@@ -42,6 +42,77 @@ function setMockCodexHome(codexHomePath: string): () => void {
+   };
+ }
+ 
++function setEnv(name: string, value?: string): () => void {
++  const previous = process.env[name];
++  if (typeof value === "string") process.env[name] = value;
++  else delete process.env[name];
++  return () => {
++    if (typeof previous === "string") process.env[name] = previous;
++    else delete process.env[name];
++  };
++}
++
++async function createFormalMemoryFixture(workspaceRoot: string): Promise<string> {
++  const memoryRoot = await mkdtemp(join(tmpdir(), "omx-overlay-memory-"));
++  const workspaceKey = "workspace-123";
++  const memoryHome = join(memoryRoot, "workspaces", workspaceKey);
++
++  await mkdir(join(memoryRoot, "workspaces"), { recursive: true });
++  await writeFile(
++    join(memoryRoot, "workspaces", "index.json"),
++    JSON.stringify(
++      {
++        version: 1,
++        workspaces: {
++          [workspaceRoot.toLowerCase()]: {
++            key: workspaceKey,
++            path: workspaceRoot,
++          },
++        },
++      },
++      null,
++      2,
++    ),
++  );
++  await mkdir(join(memoryHome, "instructions", "repo"), { recursive: true });
++  await mkdir(join(memoryHome, "memories"), { recursive: true });
++  await mkdir(join(memoryHome, "runtime"), { recursive: true });
++  await writeFile(
++    join(memoryHome, "instructions", "repo", "GUIDE.md"),
++    "# Repo Guide\nUse formal repo guidance.\n",
++  );
++  await writeFile(
++    join(memoryHome, "memories", "MEMORY.md"),
++    "# Workspace Memory\nFormal durable truth.\n",
++  );
++  await writeFile(
++    join(memoryHome, "runtime", "active_context.md"),
++    "# Active Context\nCurrent task context from formal memory.\n",
++  );
++
++  return memoryRoot;
++}
++
++async function createSharedGuideOnlyMemoryFixture(): Promise<string> {
++  const memoryRoot = await mkdtemp(join(tmpdir(), "omx-overlay-shared-memory-"));
++  await mkdir(join(memoryRoot, "instructions", "company"), { recursive: true });
++  await mkdir(join(memoryRoot, "instructions", "user"), { recursive: true });
++  await mkdir(join(memoryRoot, "instructions", "local"), { recursive: true });
++  await writeFile(
++    join(memoryRoot, "instructions", "company", "GUIDE.md"),
++    "# Company Guide\nShared company guidance.\n",
++  );
++  await writeFile(
++    join(memoryRoot, "instructions", "user", "GUIDE.md"),
++    "# User Guide\nShared user guidance.\n",
++  );
++  await writeFile(
++    join(memoryRoot, "instructions", "local", "GUIDE.md"),
++    "# Local Guide\nShared local guidance.\n",
++  );
++  return memoryRoot;
++}
++
+ describe("generateOverlay", () => {
+   let tempDir: string;
+   before(async () => {
+@@ -165,6 +236,48 @@ describe("generateOverlay", () => {
+     assert.ok(!overlay.includes("Low priority thing"));
+   });
+ 
++  it("prefers formal memory summary over local project-memory.json in strict mode", async () => {
++    const memoryRoot = await createFormalMemoryFixture(tempDir);
++    const restoreStrict = setEnv("OMX_STRICT_MEMORY_MODE", "1");
++    const restoreMemoryRoot = setEnv("OMX_EXTERNAL_MEMORY_ROOT", memoryRoot);
++    try {
++      await writeFile(
++        join(tempDir, ".omx", "project-memory.json"),
++        JSON.stringify({
++          techStack: "Legacy local summary",
++          directives: [{ directive: "Local directive", priority: "high" }],
++        }),
++      );
++
++      const overlay = await generateOverlay(tempDir, "strict-project-memory");
++      assert.match(overlay, /Current task context from formal memory/);
++      assert.match(overlay, /Formal durable truth/);
++      assert.match(overlay, /Use formal repo guidance/);
++      assert.doesNotMatch(overlay, /Legacy local summary/);
++      assert.doesNotMatch(overlay, /Local directive/);
++    } finally {
++      restoreStrict();
++      restoreMemoryRoot();
++      await rm(memoryRoot, { recursive: true, force: true });
++    }
++  });
++
++  it("falls back to shared formal guides when strict mode has no registered workspace", async () => {
++    const memoryRoot = await createSharedGuideOnlyMemoryFixture();
++    const restoreStrict = setEnv("OMX_STRICT_MEMORY_MODE", "1");
++    const restoreMemoryRoot = setEnv("OMX_EXTERNAL_MEMORY_ROOT", memoryRoot);
++    try {
++      const overlay = await generateOverlay(tempDir, "strict-shared-guides");
++      assert.match(overlay, /Shared company guidance/);
++      assert.match(overlay, /Shared user guidance/);
++      assert.match(overlay, /Shared local guidance/);
++    } finally {
++      restoreStrict();
++      restoreMemoryRoot();
++      await rm(memoryRoot, { recursive: true, force: true });
++    }
++  });
++
+   it("enforces size cap (overlay <= 3500 chars)", async () => {
+     const longText = "A".repeat(5000);
+     await writeFile(
+diff --git a/src/hooks/agents-overlay.ts b/src/hooks/agents-overlay.ts
+index 002727c..655c220 100644
+--- a/src/hooks/agents-overlay.ts
++++ b/src/hooks/agents-overlay.ts
+@@ -24,6 +24,11 @@ import {
+   omxProjectMemoryPath,
+   packageRoot,
+ } from "../utils/paths.js";
++import {
++  buildFormalProjectMemorySummary,
++  readFormalMemoryContext,
++  resolveStrictMemoryConfig,
++} from "../integration/formal-memory.js";
+ import {
+   isPlanningComplete,
+   readPlanningArtifacts,
+@@ -250,6 +255,12 @@ async function readNotepadPriority(cwd: string): Promise<string> {
+ }
+ 
+ async function readProjectMemorySummary(cwd: string): Promise<string> {
++  const strictConfig = resolveStrictMemoryConfig();
++  if (strictConfig.strictMode) {
++    const context = await readFormalMemoryContext(cwd);
++    return buildFormalProjectMemorySummary(context);
++  }
++
+   const memPath = omxProjectMemoryPath(cwd);
+   if (!existsSync(memPath)) return "";
+ 
+@@ -277,8 +288,8 @@ function getCompactionInstructions(): string {
+   return [
+     "Before context compaction, preserve critical state:",
+     "1. Write progress checkpoint via state_write MCP tool",
+-    "2. Save key decisions to notepad via notepad_write_working",
+-    "3. If context is >80% full, proactively checkpoint state",
++    "2. Save run-local decisions to notepad via notepad_write_working",
++    "3. Promote durable memory only through the external refresh pipeline",
+   ].join("\n");
+ }
+ 
+diff --git a/src/integration/__tests__/formal-memory.test.ts b/src/integration/__tests__/formal-memory.test.ts
+new file mode 100644
+index 0000000..e85d63f
+--- /dev/null
++++ b/src/integration/__tests__/formal-memory.test.ts
+@@ -0,0 +1,141 @@
++import { describe, it } from 'node:test';
++import assert from 'node:assert/strict';
++import { mkdtemp, mkdir, writeFile, readFile, rm } from 'fs/promises';
++import { existsSync } from 'fs';
++import { join } from 'path';
++import { tmpdir } from 'os';
++
++import {
++  appendMemoryIntakeEntry,
++  buildFormalProjectMemorySummary,
++  buildFormalProjectMemoryView,
++  readFormalMemoryContext,
++  resolveStrictMemoryConfig,
++} from '../formal-memory.js';
++
++async function makeFixture() {
++  const workspaceRoot = await mkdtemp(join(tmpdir(), 'omx-formal-workspace-'));
++  const memoryRoot = await mkdtemp(join(tmpdir(), 'omx-formal-memory-'));
++  const workspaceKey = 'workspace-123';
++  const memoryHome = join(memoryRoot, 'workspaces', workspaceKey);
++
++  await mkdir(join(memoryRoot, 'workspaces'), { recursive: true });
++  await writeFile(
++    join(memoryRoot, 'workspaces', 'index.json'),
++    JSON.stringify(
++      {
++        version: 1,
++        workspaces: {
++          [workspaceRoot.toLowerCase()]: {
++            key: workspaceKey,
++            path: workspaceRoot,
++          },
++        },
++      },
++      null,
++      2,
++    ),
++  );
++
++  await mkdir(join(memoryRoot, 'instructions', 'company'), { recursive: true });
++  await mkdir(join(memoryRoot, 'instructions', 'user'), { recursive: true });
++  await mkdir(join(memoryRoot, 'instructions', 'local'), { recursive: true });
++  await mkdir(join(memoryHome, 'instructions', 'repo'), { recursive: true });
++  await mkdir(join(memoryHome, 'memories'), { recursive: true });
++  await mkdir(join(memoryHome, 'runtime'), { recursive: true });
++
++  await writeFile(join(memoryRoot, 'instructions', 'company', 'GUIDE.md'), '# Company\nCompany guide\n');
++  await writeFile(join(memoryRoot, 'instructions', 'user', 'GUIDE.md'), '# User\nUser guide\n');
++  await writeFile(join(memoryRoot, 'instructions', 'local', 'GUIDE.md'), '# Local\nLocal guide\n');
++  await writeFile(join(memoryHome, 'instructions', 'repo', 'GUIDE.md'), '# Repo\nUse ESM modules.\n');
++  await writeFile(join(memoryHome, 'memories', 'MEMORY.md'), '# Memory\nWorkspace durable truth.\n');
++  await writeFile(join(memoryHome, 'runtime', 'active_context.md'), '# Active\nCurrent task context.\n');
++
++  return {
++    workspaceRoot,
++    memoryRoot,
++  };
++}
++
++describe('integration/formal-memory', () => {
++  it('resolves strict config from env', () => {
++    const config = resolveStrictMemoryConfig({
++      OMX_STRICT_MEMORY_MODE: 'true',
++      OMX_EXTERNAL_MEMORY_ROOT: '/tmp/custom-memory-root',
++    });
++
++    assert.equal(config.strictMode, true);
++    assert.equal(config.memoryRoot, '/tmp/custom-memory-root');
++  });
++
++  it('reads formal memory context and summary for a registered workspace', async () => {
++    const fixture = await makeFixture();
++
++    try {
++      const context = await readFormalMemoryContext(fixture.workspaceRoot, {
++        OMX_STRICT_MEMORY_MODE: 'true',
++        OMX_EXTERNAL_MEMORY_ROOT: fixture.memoryRoot,
++      });
++      const summary = buildFormalProjectMemorySummary(context);
++      const view = buildFormalProjectMemoryView(context);
++
++      assert.equal(context.workspace.registered, true);
++      assert.match(summary, /Current task context/);
++      assert.match(summary, /Workspace durable truth/);
++      assert.match(summary, /Use ESM modules/);
++      assert.equal(view.source, 'formal-memory');
++    } finally {
++      await rm(fixture.workspaceRoot, { recursive: true, force: true });
++      await rm(fixture.memoryRoot, { recursive: true, force: true });
++    }
++  });
++
++  it('falls back to shared guides when the workspace is not registered', async () => {
++    const workspaceRoot = await mkdtemp(join(tmpdir(), 'omx-formal-unregistered-'));
++    const memoryRoot = await mkdtemp(join(tmpdir(), 'omx-formal-shared-'));
++
++    try {
++      await mkdir(join(memoryRoot, 'instructions', 'company'), { recursive: true });
++      await mkdir(join(memoryRoot, 'instructions', 'user'), { recursive: true });
++      await mkdir(join(memoryRoot, 'instructions', 'local'), { recursive: true });
++      await writeFile(join(memoryRoot, 'instructions', 'company', 'GUIDE.md'), '# Company\nShared company guidance.\n');
++      await writeFile(join(memoryRoot, 'instructions', 'user', 'GUIDE.md'), '# User\nShared user guidance.\n');
++      await writeFile(join(memoryRoot, 'instructions', 'local', 'GUIDE.md'), '# Local\nShared local guidance.\n');
++
++      const context = await readFormalMemoryContext(workspaceRoot, {
++        OMX_STRICT_MEMORY_MODE: 'true',
++        OMX_EXTERNAL_MEMORY_ROOT: memoryRoot,
++      });
++      const summary = buildFormalProjectMemorySummary(context);
++
++      assert.equal(context.workspace.registered, false);
++      assert.match(summary, /Shared company guidance/);
++      assert.match(summary, /Shared user guidance/);
++      assert.match(summary, /Shared local guidance/);
++    } finally {
++      await rm(workspaceRoot, { recursive: true, force: true });
++      await rm(memoryRoot, { recursive: true, force: true });
++    }
++  });
++
++  it('downgrades durable candidates into a run-local intake queue', async () => {
++    const workspaceRoot = await mkdtemp(join(tmpdir(), 'omx-formal-intake-'));
++
++    try {
++      const result = await appendMemoryIntakeEntry({
++        cwd: workspaceRoot,
++        kind: 'note',
++        content: 'Queue this observation.',
++        metadata: { category: 'architecture' },
++        source: 'test',
++      });
++
++      assert.equal(existsSync(result.path), true);
++      const raw = await readFile(result.path, 'utf-8');
++      assert.match(raw, /Queue this observation/);
++      assert.match(raw, /"kind":"note"/);
++    } finally {
++      await rm(workspaceRoot, { recursive: true, force: true });
++    }
++  });
++});
+diff --git a/src/integration/formal-memory.ts b/src/integration/formal-memory.ts
+new file mode 100644
+index 0000000..3365262
+--- /dev/null
++++ b/src/integration/formal-memory.ts
+@@ -0,0 +1,278 @@
++import { createHash } from 'crypto';
++import { existsSync } from 'fs';
++import { appendFile, mkdir, readFile } from 'fs/promises';
++import { join, resolve } from 'path';
++
++import { codexHome } from '../utils/paths.js';
++
++const WORKSPACE_INDEX_RELATIVE_PATH = join('workspaces', 'index.json');
++const SHARED_GUIDE_RELATIVE_PATHS = [
++  ['company', join('instructions', 'company', 'GUIDE.md')],
++  ['user', join('instructions', 'user', 'GUIDE.md')],
++  ['local', join('instructions', 'local', 'GUIDE.md')],
++] as const;
++
++export interface StrictMemoryConfig {
++  strictMode: boolean;
++  memoryRoot: string;
++}
++
++export interface FormalMemoryContext {
++  source: 'formal-memory';
++  strictMode: boolean;
++  memoryRoot: string;
++  workspace: {
++    registered: boolean;
++    key?: string;
++    root?: string;
++    memoryHome?: string;
++  };
++  repoGuide: string;
++  workspaceMemory: string;
++  activeContext: string;
++  sharedGuides: Record<string, string>;
++}
++
++function defaultExternalMemoryRoot(): string {
++  return join(codexHome(), 'memory');
++}
++
++function normalizeLookupPath(value: string): string {
++  return resolve(value).replace(/\\/g, '/').toLowerCase();
++}
++
++async function readTextIfExists(filePath: string): Promise<string> {
++  try {
++    return await readFile(filePath, 'utf-8');
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
++      return '';
++    }
++    throw error;
++  }
++}
++
++function summarizeSnippet(value: string, maxChars = 240): string {
++  const normalized = value
++    .replace(/^#+\s+/gm, '')
++    .replace(/\s+/g, ' ')
++    .trim();
++
++  if (!normalized) return '';
++  if (normalized.length <= maxChars) return normalized;
++  return `${normalized.slice(0, maxChars - 3)}...`;
++}
++
++export function parseBooleanFlag(value: unknown): boolean | undefined {
++  if (typeof value !== 'string') return undefined;
++  const normalized = value.trim().toLowerCase();
++  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
++  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
++  return undefined;
++}
++
++export function resolveStrictMemoryConfig(
++  env: Record<string, string | undefined> = process.env,
++): StrictMemoryConfig {
++  return {
++    strictMode: parseBooleanFlag(env.OMX_STRICT_MEMORY_MODE) ?? false,
++    memoryRoot: resolve(env.OMX_EXTERNAL_MEMORY_ROOT || defaultExternalMemoryRoot()),
++  };
++}
++
++export async function loadWorkspaceIndex(memoryRoot: string): Promise<Record<string, unknown> | null> {
++  const indexPath = join(memoryRoot, WORKSPACE_INDEX_RELATIVE_PATH);
++  if (!existsSync(indexPath)) return null;
++  return JSON.parse(await readFile(indexPath, 'utf-8')) as Record<string, unknown>;
++}
++
++export async function resolveFormalWorkspaceNode(
++  cwd: string,
++  memoryRoot: string,
++): Promise<{ key: string; root: string; memoryHome: string } | null> {
++  const index = await loadWorkspaceIndex(memoryRoot);
++  const workspaces = index?.workspaces as Record<string, { key?: string; path?: string }> | undefined;
++  if (!workspaces || typeof workspaces !== 'object') return null;
++
++  const lookupCwd = normalizeLookupPath(cwd);
++  let bestMatch: { key: string; root: string; memoryHome: string; lookupPath: string } | null = null;
++
++  for (const [storedPath, entry] of Object.entries(workspaces)) {
++    if (!entry || typeof entry !== 'object' || typeof entry.key !== 'string') continue;
++    const registeredPath = typeof entry.path === 'string' ? entry.path : storedPath;
++    const candidatePath = normalizeLookupPath(registeredPath);
++    if (lookupCwd !== candidatePath && !lookupCwd.startsWith(`${candidatePath}/`)) {
++      continue;
++    }
++
++    if (!bestMatch || candidatePath.length > bestMatch.lookupPath.length) {
++      bestMatch = {
++        key: entry.key,
++        root: resolve(registeredPath),
++        memoryHome: join(memoryRoot, 'workspaces', entry.key),
++        lookupPath: candidatePath,
++      };
++    }
++  }
++
++  if (!bestMatch) return null;
++  return {
++    key: bestMatch.key,
++    root: bestMatch.root,
++    memoryHome: bestMatch.memoryHome,
++  };
++}
++
++export async function readFormalMemoryContext(
++  cwd: string,
++  env: Record<string, string | undefined> = process.env,
++): Promise<FormalMemoryContext> {
++  const config = resolveStrictMemoryConfig(env);
++  const workspace = await resolveFormalWorkspaceNode(cwd, config.memoryRoot);
++  const sharedGuides = Object.fromEntries(
++    await Promise.all(
++      SHARED_GUIDE_RELATIVE_PATHS.map(async ([key, relativePath]) => [
++        key,
++        await readTextIfExists(join(config.memoryRoot, relativePath)),
++      ]),
++    ),
++  );
++
++  if (!workspace) {
++    return {
++      source: 'formal-memory',
++      strictMode: config.strictMode,
++      memoryRoot: config.memoryRoot,
++      workspace: {
++        registered: false,
++      },
++      repoGuide: '',
++      workspaceMemory: '',
++      activeContext: '',
++      sharedGuides,
++    };
++  }
++
++  const repoGuidePath = join(workspace.memoryHome, 'instructions', 'repo', 'GUIDE.md');
++  const workspaceMemoryPath = join(workspace.memoryHome, 'memories', 'MEMORY.md');
++  const activeContextPath = join(workspace.memoryHome, 'runtime', 'active_context.md');
++
++  const [repoGuide, workspaceMemory, activeContext] = await Promise.all([
++    readTextIfExists(repoGuidePath),
++    readTextIfExists(workspaceMemoryPath),
++    readTextIfExists(activeContextPath),
++  ]);
++
++  return {
++    source: 'formal-memory',
++    strictMode: config.strictMode,
++    memoryRoot: config.memoryRoot,
++    workspace: {
++      registered: true,
++      key: workspace.key,
++      root: workspace.root,
++      memoryHome: workspace.memoryHome,
++    },
++    repoGuide,
++    workspaceMemory,
++    activeContext,
++    sharedGuides,
++  };
++}
++
++export function buildFormalProjectMemorySummary(context: FormalMemoryContext): string {
++  const parts: string[] = [];
++
++  if (context.activeContext) {
++    parts.push(`- Active Context: ${summarizeSnippet(context.activeContext)}`);
++  }
++  if (context.workspaceMemory) {
++    parts.push(`- Workspace Memory: ${summarizeSnippet(context.workspaceMemory)}`);
++  }
++  if (context.repoGuide) {
++    parts.push(`- Repo Guide: ${summarizeSnippet(context.repoGuide)}`);
++  }
++
++  if (parts.length === 0) {
++    for (const [key, value] of Object.entries(context.sharedGuides)) {
++      if (!value) continue;
++      parts.push(`- Shared Guide (${key}): ${summarizeSnippet(value)}`);
++    }
++  }
++
++  return parts.join('\n');
++}
++
++export function buildFormalProjectMemoryView(
++  context: FormalMemoryContext,
++  section?: string,
++): Record<string, unknown> {
++  const view = {
++    source: 'formal-memory',
++    strictMode: context.strictMode,
++    workspace: context.workspace,
++    summary: buildFormalProjectMemorySummary(context),
++    sections: {
++      activeContext: context.activeContext,
++      workspaceMemory: context.workspaceMemory,
++      repoGuide: context.repoGuide,
++      sharedGuides: context.sharedGuides,
++    },
++  };
++
++  if (section && section !== 'all') {
++    return {
++      ...view,
++      requestedSection: section,
++      message:
++        'Strict integration mode exposes a formal summary view instead of legacy .omx/project-memory.json sections.',
++    };
++  }
++
++  return view;
++}
++
++function buildIntakeEntryId(payload: Record<string, unknown>): string {
++  const hash = createHash('sha1')
++    .update(JSON.stringify(payload))
++    .digest('hex')
++    .slice(0, 12);
++  return `intake-${hash}`;
++}
++
++export async function appendMemoryIntakeEntry({
++  cwd,
++  kind,
++  content,
++  metadata = {},
++  source,
++}: {
++  cwd: string;
++  kind: string;
++  content: string;
++  metadata?: Record<string, unknown>;
++  source: string;
++}): Promise<{ path: string; entry: Record<string, unknown> }> {
++  const createdAt = new Date().toISOString();
++  const entry = {
++    id: buildIntakeEntryId({
++      kind,
++      content,
++      metadata,
++      source,
++      createdAt,
++    }),
++    kind,
++    content,
++    metadata,
++    source,
++    created_at: createdAt,
++  };
++  const intakePath = join(cwd, '.omx', 'memory-intake.jsonl');
++  await mkdir(join(cwd, '.omx'), { recursive: true });
++  await appendFile(intakePath, `${JSON.stringify(entry)}\n`, 'utf-8');
++  return {
++    path: intakePath,
++    entry,
++  };
++}
+diff --git a/src/mcp/__tests__/memory-server-strict-mode.test.ts b/src/mcp/__tests__/memory-server-strict-mode.test.ts
+new file mode 100644
+index 0000000..6740654
+--- /dev/null
++++ b/src/mcp/__tests__/memory-server-strict-mode.test.ts
+@@ -0,0 +1,188 @@
++import { describe, it } from 'node:test';
++import assert from 'node:assert/strict';
++import { mkdtemp, mkdir, readFile, rm, writeFile } from 'fs/promises';
++import { existsSync } from 'fs';
++import { join } from 'path';
++import { tmpdir } from 'os';
++
++async function makeFixture() {
++  const workspaceRoot = await mkdtemp(join(tmpdir(), 'omx-memory-server-workspace-'));
++  const memoryRoot = await mkdtemp(join(tmpdir(), 'omx-memory-server-memory-'));
++  const workspaceKey = 'workspace-123';
++  const memoryHome = join(memoryRoot, 'workspaces', workspaceKey);
++
++  await mkdir(join(memoryRoot, 'workspaces'), { recursive: true });
++  await writeFile(
++    join(memoryRoot, 'workspaces', 'index.json'),
++    JSON.stringify(
++      {
++        version: 1,
++        workspaces: {
++          [workspaceRoot.toLowerCase()]: {
++            key: workspaceKey,
++            path: workspaceRoot,
++          },
++        },
++      },
++      null,
++      2,
++    ),
++  );
++
++  await mkdir(join(memoryHome, 'instructions', 'repo'), { recursive: true });
++  await mkdir(join(memoryHome, 'memories'), { recursive: true });
++  await mkdir(join(memoryHome, 'runtime'), { recursive: true });
++  await writeFile(join(memoryHome, 'instructions', 'repo', 'GUIDE.md'), '# Repo\nUse pnpm.\n');
++  await writeFile(join(memoryHome, 'memories', 'MEMORY.md'), '# Memory\nWorkspace durable truth.\n');
++  await writeFile(join(memoryHome, 'runtime', 'active_context.md'), '# Active\nCurrent task context.\n');
++  await mkdir(join(workspaceRoot, '.omx'), { recursive: true });
++  await writeFile(
++    join(workspaceRoot, '.omx', 'project-memory.json'),
++    JSON.stringify({ techStack: 'Legacy local memory' }, null, 2),
++  );
++
++  return {
++    workspaceRoot,
++    memoryRoot,
++  };
++}
++
++async function loadMemoryServerModule() {
++  const previous = process.env.OMX_MEMORY_SERVER_DISABLE_AUTO_START;
++  process.env.OMX_MEMORY_SERVER_DISABLE_AUTO_START = '1';
++  try {
++    return await import(`../memory-server.js?strict-memory-test=${Date.now()}-${Math.random()}`);
++  } finally {
++    if (typeof previous === 'string') process.env.OMX_MEMORY_SERVER_DISABLE_AUTO_START = previous;
++    else delete process.env.OMX_MEMORY_SERVER_DISABLE_AUTO_START;
++  }
++}
++
++function parseToolPayload(result: { content: Array<{ text: string }>; isError?: boolean }) {
++  return {
++    ...result,
++    data: JSON.parse(result.content[0].text),
++  };
++}
++
++describe('mcp/memory-server strict mode behavior', () => {
++  it('reads formal memory instead of local project-memory.json in strict mode', async () => {
++    const fixture = await makeFixture();
++
++    try {
++      const mod = await loadMemoryServerModule();
++      const result = parseToolPayload(
++        await mod.handleMemoryToolCall(
++          'project_memory_read',
++          {
++            workingDirectory: fixture.workspaceRoot,
++          },
++          {
++            OMX_STRICT_MEMORY_MODE: 'true',
++            OMX_EXTERNAL_MEMORY_ROOT: fixture.memoryRoot,
++          },
++        ),
++      );
++
++      assert.equal(result.isError, undefined);
++      assert.equal(result.data.source, 'formal-memory');
++      assert.match(result.data.summary, /Current task context/);
++      assert.doesNotMatch(JSON.stringify(result.data), /Legacy local memory/);
++    } finally {
++      await rm(fixture.workspaceRoot, { recursive: true, force: true });
++      await rm(fixture.memoryRoot, { recursive: true, force: true });
++    }
++  });
++
++  it('denies direct project_memory_write in strict mode', async () => {
++    const fixture = await makeFixture();
++
++    try {
++      const mod = await loadMemoryServerModule();
++      const result = parseToolPayload(
++        await mod.handleMemoryToolCall(
++          'project_memory_write',
++          {
++            workingDirectory: fixture.workspaceRoot,
++            memory: { should: 'not persist' },
++          },
++          {
++            OMX_STRICT_MEMORY_MODE: 'true',
++            OMX_EXTERNAL_MEMORY_ROOT: fixture.memoryRoot,
++          },
++        ),
++      );
++
++      assert.equal(result.isError, true);
++      assert.equal(result.data.decision, 'deny');
++
++      const localRaw = await readFile(join(fixture.workspaceRoot, '.omx', 'project-memory.json'), 'utf-8');
++      assert.match(localRaw, /Legacy local memory/);
++      assert.doesNotMatch(localRaw, /should/);
++    } finally {
++      await rm(fixture.workspaceRoot, { recursive: true, force: true });
++      await rm(fixture.memoryRoot, { recursive: true, force: true });
++    }
++  });
++
++  it('downgrades project_memory_add_note into memory-intake.jsonl in strict mode', async () => {
++    const fixture = await makeFixture();
++
++    try {
++      const mod = await loadMemoryServerModule();
++      const result = parseToolPayload(
++        await mod.handleMemoryToolCall(
++          'project_memory_add_note',
++          {
++            workingDirectory: fixture.workspaceRoot,
++            category: 'architecture',
++            content: 'Queue this note.',
++          },
++          {
++            OMX_STRICT_MEMORY_MODE: 'true',
++            OMX_EXTERNAL_MEMORY_ROOT: fixture.memoryRoot,
++          },
++        ),
++      );
++
++      assert.equal(result.data.decision, 'downgrade');
++      assert.equal(existsSync(join(fixture.workspaceRoot, '.omx', 'memory-intake.jsonl')), true);
++      const intakeRaw = await readFile(join(fixture.workspaceRoot, '.omx', 'memory-intake.jsonl'), 'utf-8');
++      assert.match(intakeRaw, /Queue this note/);
++    } finally {
++      await rm(fixture.workspaceRoot, { recursive: true, force: true });
++      await rm(fixture.memoryRoot, { recursive: true, force: true });
++    }
++  });
++
++  it('downgrades project_memory_add_directive into memory-intake.jsonl in strict mode', async () => {
++    const fixture = await makeFixture();
++
++    try {
++      const mod = await loadMemoryServerModule();
++      const result = parseToolPayload(
++        await mod.handleMemoryToolCall(
++          'project_memory_add_directive',
++          {
++            workingDirectory: fixture.workspaceRoot,
++            directive: 'Keep promotion gated.',
++            priority: 'high',
++            context: 'review',
++          },
++          {
++            OMX_STRICT_MEMORY_MODE: 'true',
++            OMX_EXTERNAL_MEMORY_ROOT: fixture.memoryRoot,
++          },
++        ),
++      );
++
++      assert.equal(result.data.decision, 'downgrade');
++      const intakeRaw = await readFile(join(fixture.workspaceRoot, '.omx', 'memory-intake.jsonl'), 'utf-8');
++      assert.match(intakeRaw, /Keep promotion gated/);
++      assert.match(intakeRaw, /"kind":"directive"/);
++    } finally {
++      await rm(fixture.workspaceRoot, { recursive: true, force: true });
++      await rm(fixture.memoryRoot, { recursive: true, force: true });
++    }
++  });
++});
+diff --git a/src/mcp/memory-server.ts b/src/mcp/memory-server.ts
+index db8a04b..036fda5 100644
+--- a/src/mcp/memory-server.ts
++++ b/src/mcp/memory-server.ts
+@@ -15,6 +15,12 @@ import { existsSync } from 'fs';
+ import { parseNotepadPruneDaysOld } from './memory-validation.js';
+ import { autoStartStdioMcpServer } from './bootstrap.js';
+ import { resolveWorkingDirectoryForState } from './state-paths.js';
++import {
++  appendMemoryIntakeEntry,
++  buildFormalProjectMemoryView,
++  readFormalMemoryContext,
++  resolveStrictMemoryConfig,
++} from '../integration/formal-memory.js';
+ 
+ function getMemoryPath(wd: string): string {
+   return join(wd, '.omx', 'project-memory.json');
+@@ -43,7 +49,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
+     // Project Memory tools
+     {
+       name: 'project_memory_read',
+-      description: 'Read project memory. Can read full memory or a specific section.',
++      description:
++        'Read project memory. In strict mode this returns a formal workspace memory summary instead of local .omx/project-memory.json.',
+       inputSchema: {
+         type: 'object',
+         properties: {
+@@ -54,7 +61,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
+     },
+     {
+       name: 'project_memory_write',
+-      description: 'Write/update project memory. Can replace entirely or merge.',
++      description:
++        'Write/update local project memory. In strict mode this is denied so durable updates must flow through the external memory pipeline.',
+       inputSchema: {
+         type: 'object',
+         properties: {
+@@ -67,7 +75,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
+     },
+     {
+       name: 'project_memory_add_note',
+-      description: 'Add a categorized note to project memory.',
++      description:
++        'Add a categorized note to project memory. In strict mode this downgrades into a run-local intake artifact.',
+       inputSchema: {
+         type: 'object',
+         properties: {
+@@ -80,7 +89,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
+     },
+     {
+       name: 'project_memory_add_directive',
+-      description: 'Add a persistent directive to project memory.',
++      description:
++        'Add a persistent directive to project memory. In strict mode this downgrades into a run-local intake artifact.',
+       inputSchema: {
+         type: 'object',
+         properties: {
+@@ -164,22 +174,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
+   ],
+ }));
+ 
+-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+-  const { name, arguments: args } = request.params;
+-  const a = (args || {}) as Record<string, unknown>;
++export async function handleMemoryToolCall(
++  name: string,
++  a: Record<string, unknown> = {},
++  env: Record<string, string | undefined> = process.env,
++) {
+   let wd: string;
+   try {
+     wd = resolveWorkingDirectoryForState(a.workingDirectory as string | undefined);
+   } catch (error) {
+-    return {
+-      content: [{ type: 'text' as const, text: JSON.stringify({ error: (error as Error).message }) }],
+-      isError: true,
+-    };
++    return errorText({ error: (error as Error).message });
+   }
++  const strictConfig = resolveStrictMemoryConfig(env);
+ 
+   switch (name) {
+     // === Project Memory ===
+     case 'project_memory_read': {
++      if (strictConfig.strictMode) {
++        const context = await readFormalMemoryContext(wd, env);
++        return text(buildFormalProjectMemoryView(context, a.section as string | undefined));
++      }
+       const memPath = getMemoryPath(wd);
+       if (!existsSync(memPath)) {
+         return text({ exists: false });
+@@ -198,6 +212,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+     }
+ 
+     case 'project_memory_write': {
++      if (strictConfig.strictMode) {
++        return errorText({
++          error:
++            'Strict integration mode forbids direct project_memory_write. Use the formal memory pipeline or a run-local intake artifact instead.',
++          decision: 'deny',
++        });
++      }
+       const memPath = getMemoryPath(wd);
+       await mkdir(join(wd, '.omx'), { recursive: true });
+       const merge = a.merge as boolean;
+@@ -218,6 +239,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+     }
+ 
+     case 'project_memory_add_note': {
++      if (strictConfig.strictMode) {
++        const intake = await appendMemoryIntakeEntry({
++          cwd: wd,
++          kind: 'note',
++          content: String(a.content as string),
++          metadata: {
++            category: a.category as string,
++          },
++          source: 'project_memory_add_note',
++        });
++        return text({
++          success: true,
++          decision: 'downgrade',
++          downgradedTo: 'memory-intake-queue',
++          intake,
++        });
++      }
+       const memPath = getMemoryPath(wd);
+       await mkdir(join(wd, '.omx'), { recursive: true });
+       let data: ProjectMemory = {};
+@@ -239,6 +277,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+     }
+ 
+     case 'project_memory_add_directive': {
++      if (strictConfig.strictMode) {
++        const intake = await appendMemoryIntakeEntry({
++          cwd: wd,
++          kind: 'directive',
++          content: String(a.directive as string),
++          metadata: {
++            priority: (a.priority as string) || 'normal',
++            context: a.context as string | undefined,
++          },
++          source: 'project_memory_add_directive',
++        });
++        return text({
++          success: true,
++          decision: 'downgrade',
++          downgradedTo: 'memory-intake-queue',
++          intake,
++        });
++      }
+       const memPath = getMemoryPath(wd);
+       await mkdir(join(wd, '.omx'), { recursive: true });
+       let data: ProjectMemory = {};
+@@ -412,12 +468,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
+     default:
+       return { content: [{ type: 'text' as const, text: `Unknown tool: ${name}` }], isError: true };
+   }
++}
++server.setRequestHandler(CallToolRequestSchema, async (request) => {
++  const { name, arguments: args } = request.params;
++  return handleMemoryToolCall(name, (args || {}) as Record<string, unknown>);
+ });
+ 
+ function text(data: unknown) {
+   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+ }
+ 
++function errorText(data: unknown) {
++  return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }], isError: true };
++}
++
+ function extractSection(content: string, section: string): string {
+   const header = `## ${section.toUpperCase()}`;
+   const idx = content.indexOf(header);
+-- 
+2.50.1 (Apple Git-155)
+

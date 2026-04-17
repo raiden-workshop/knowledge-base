@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Read the worker handoff first
+    url: https://github.com/raiden-workshop/knowledge-base/blob/main/WORKER_HANDOFF.md
+    about: Review the current workflow, read order, and domain rules before opening a broad issue.
