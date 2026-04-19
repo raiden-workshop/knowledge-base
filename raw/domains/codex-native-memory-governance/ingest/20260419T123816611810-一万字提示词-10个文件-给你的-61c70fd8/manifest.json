@@ -1,0 +1,32 @@
+{
+  "ingest_id": "20260419T123816611810-一万字提示词-10个文件-给你的-61c70fd8",
+  "target_type": "file",
+  "domain": "codex-native-memory-governance",
+  "source_title": "一万字提示词+10个文件，给你的AI造一个“数字灵魂”",
+  "source_locator": "/Users/wz/Library/Mobile Documents/com~apple~CloudDocs/办公共享/一万字提示词+10个文件，给你的AI造一个“数字灵魂”.pdf",
+  "content_hash": "61c70fd8c92028748f5f85cb976035ab1f42adc35ceb2db5b809b0385999cc91",
+  "duplicate_status": "none",
+  "relation_type": "new",
+  "related_pages": [],
+  "review_status": "accepted",
+  "allow_duplicate": false,
+  "content_type": "application/pdf",
+  "original_file": "raw/domains/codex-native-memory-governance/ingest/20260419T123816611810-一万字提示词-10个文件-给你的-61c70fd8/一万字提示词+10个文件，给你的AI造一个“数字灵魂”.pdf",
+  "extracted_file": "raw/domains/codex-native-memory-governance/ingest/20260419T123816611810-一万字提示词-10个文件-给你的-61c70fd8/extracted.md",
+  "draft_bundle": "output/ingest-drafts/20260419T123816611810-一万字提示词-10个文件-给你的-61c70fd8",
+  "draft_pages": [
+    "output/ingest-drafts/20260419T123816611810-一万字提示词-10个文件-给你的-61c70fd8/wiki/sources/source-一万字提示词-10个文件-给你的ai造一个-数字灵魂.md"
+  ],
+  "duplicate_matches": [],
+  "notes": [
+    "Extracted text is weak; keep this ingest in source-only review mode."
+  ],
+  "extraction_mode": "pdf-text",
+  "extraction_quality": "weak",
+  "created_at": "2026-04-19T12:38:16+08:00",
+  "updated_at": "2026-04-19T12:38:31+08:00",
+  "applied_at": "2026-04-19T12:38:31+08:00",
+  "applied_pages": [
+    "wiki/sources/source-一万字提示词-10个文件-给你的ai造一个-数字灵魂.md"
+  ]
+}

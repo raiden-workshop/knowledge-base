@@ -3,7 +3,7 @@ title: "Knowledge Base Log"
 type: report
 status: active
 created_at: 2026-04-09
-updated_at: 2026-04-11
+updated_at: 2026-04-19
 source_refs: []
 related:
   - index
@@ -115,3 +115,14 @@ related:
 - Reviewed canonical pages flagged by `kb drift-review` against newer supporting source pages
 - Refreshed affected concept, entity, and synthesis pages so archived artifact-home details and rollout status remain aligned
 - Updated `wiki/hot.md`, `wiki/index.md`, `wiki/overview.md`, and generated a dedicated drift review report for the new maintenance surface
+## [2026-04-19] ingest | accept source-几乎涵盖所有事物的法典
+
+- Accepted output/ingest-drafts/20260419T122130763476-https-mp-weixin--19b6fb6b/wiki/sources/source-几乎涵盖所有事物的法典.md
+- Applied ingest bundle 20260419T122130763476-https-mp-weixin--19b6fb6b
+## [2026-04-19] ingest | add concept-memory-driven-user-feature-initialization
+
+- Added wiki/concepts/concept-memory-driven-user-feature-initialization.md
+## [2026-04-19] ingest | accept source-一万字提示词-10个文件-给你的ai造一个-数字灵魂
+
+- Accepted output/ingest-drafts/20260419T123816611810-一万字提示词-10个文件-给你的-61c70fd8/wiki/sources/source-一万字提示词-10个文件-给你的ai造一个-数字灵魂.md
+- Applied ingest bundle 20260419T123816611810-一万字提示词-10个文件-给你的-61c70fd8
