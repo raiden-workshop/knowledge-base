@@ -7,6 +7,12 @@ cd /Users/wz/project/knowledge-base
 ./kb <command> ...
 ```
 
+`./kb extract ...` 本身会自动优先使用仓库内的 `output/runtime-markitdown`，所以它是主入口。
+
+`./kb ingest ...` 现在也会先自动走同一个本地 `markitdown` 运行环境，把原件转换成 Markdown，再生成 ingest bundle 和 source draft。
+
+如果你已经习惯了 `./kb-with-markitdown`，它只是一个可选的薄封装，不是必需步骤。
+
 常用别名：
 
 - `search` / `ask` = `query`
@@ -61,6 +67,70 @@ cd /Users/wz/project/knowledge-base
 ```bash
 ./kb log ingest --summary "add source-my-doc" --note "Added wiki/sources/source-my-doc.md"
 ```
+
+## `extract` / `extract-offline`
+
+对本地文件执行离线 `MarkItDown` 提取，并先写中间产物，不直接写正式 wiki。
+
+```bash
+./kb extract /absolute/path/to/file.pdf
+./kb extract /absolute/path/to/file.docx --json
+./kb extract /absolute/path/to/file.md --request-id extract-my-doc --json
+```
+
+当前约束：
+
+- 只支持本地文件路径
+- 默认只使用本地 `MarkItDown` 基础转换能力
+- 不允许 `llm_client`
+- 不允许 `markitdown-ocr`
+- 不允许 Azure Document Intelligence
+- 不会直接更新 `wiki/index.md`、`wiki/log.md` 或 canonical page
+
+运行产物：
+
+- `artifacts/extract/<request_id>/request.json`
+- `artifacts/extract/<request_id>/result.json`
+- `artifacts/extract/<request_id>/content.md`
+
+返回规则：
+
+- `succeeded`：提取成功
+- `low_confidence`：提取结果过空或接近空，需要人工复查
+- `failed`：提取失败，会保留失败产物
+
+依赖说明：
+
+- 当前机器需要可用的 `markitdown` Python 包或 `markitdown` CLI
+- 若依赖缺失，命令会显式失败并返回 `markitdown unavailable`
+
+本地运行环境示例：
+
+```bash
+cd /Users/wz/project/knowledge-base
+python3.11 -m venv output/runtime-markitdown
+output/runtime-markitdown/bin/pip install 'markitdown[pdf]'
+./kb extract /absolute/path/to/file.pdf --json
+```
+
+如果你把文档交给 `knowledge-base` worker 并要求“整理到知识库”，它会优先复用这条本地离线提取链路；主入口就是 `./kb extract`，它会自动识别本地运行环境，不需要你手工记 `PATH`。`./kb-with-markitdown` 只是可选兼容层。前提仍然是该 worker 真的在 `/Users/wz/project/knowledge-base` 里执行，并且按这个仓库约定读取了 `README.md` / `KB_COMMANDS.md`。
+
+## `ingest`
+
+把 URL 或本地文件收进 ingest bundle，并生成待审 source draft。
+
+```bash
+./kb ingest /absolute/path/to/file.pdf --domain codex-native-memory-governance
+./kb ingest https://example.com/page --domain codex-native-memory-governance --json
+```
+
+当前固定行为：
+
+- 文件型收录会先自动调用本地 `markitdown`
+- 转换结果会落到本次 bundle 的 `extracted.md`
+- `manifest.json` 会记录 `extraction_mode / extractor_name / extractor_version`
+- 如果本地 `markitdown` 不可用或转换失败，命令会显式失败
+- URL 正文过弱时仍会进入 `needs_browser_capture`
 
 ## `maintain`
 
@@ -117,4 +187,3 @@ cd /Users/wz/project/knowledge-base
 ```bash
 ./kb distill-memory wiki/concepts/concept-formal-memory-authority.md
 ```
-

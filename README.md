@@ -7,6 +7,8 @@
 ## 当前范围
 
 - Phase 1 已落地：独立仓库 + 分域基础
+- 离线文档提取基础已落地：`./kb extract <local-file>` 会生成 `artifacts/extract/<request_id>/...` 中间产物
+- 文件型 ingest 已统一接入本地 `markitdown`：`./kb ingest` 会先把原件转换成 Markdown，再生成 ingest bundle 与 draft
 - 当前 founding domain：`codex-native-memory-governance`
 - Phase 2 尚未开始：飞书机器人还没有接入
 
@@ -49,9 +51,78 @@ categories:
 cd /Users/wz/project/knowledge-base
 
 ./kb query "formal memory" --domain codex-native-memory-governance --category architecture --json
+./kb ingest /absolute/path/to/file.pdf --domain codex-native-memory-governance --json
+./kb extract /absolute/path/to/file.pdf --json
 ./kb maintain
 ./kb reindex --write
 ```
+
+## 收录默认链路
+
+文件型收录现在固定走这条顺序：
+
+1. `./kb ingest <target>`
+2. 保留原件到 `raw/domains/<domain>/ingest/<ingest-id>/`
+3. 自动调用本地 `markitdown`
+4. 生成 `extracted.md`
+5. 基于提取稿生成 draft bundle，再进入 review/apply
+
+约束固定如下：
+
+- 本地文件和可落地为文件的 URL，都先走本地 `markitdown`
+- 不调用外部 API
+- 不启用 `llm_client`
+- 不启用 `markitdown-ocr`
+- 不使用 Azure Document Intelligence
+- 如果本地 `markitdown` 不可用或转换失败，`ingest` 会显式失败，不会静默回退到旧提取器
+- `manifest.json` 会记录 `extraction_mode / extractor_name / extractor_version`
+
+## 离线提取
+
+当前已支持一个最小离线提取入口：
+
+```bash
+./kb extract /absolute/path/to/file.pdf --json
+```
+
+约束固定如下：
+
+- 只支持本地文件输入
+- 默认复用与 `ingest` 相同的本地 `MarkItDown` 基础转换能力
+- 不调用外部 API
+- 不启用 `llm_client`
+- 不启用 `markitdown-ocr`
+- 不使用 Azure Document Intelligence
+
+运行结果会先落到：
+
+- `artifacts/extract/<request_id>/request.json`
+- `artifacts/extract/<request_id>/result.json`
+- `artifacts/extract/<request_id>/content.md`
+
+如果仓库内存在 `output/runtime-markitdown`，`./kb ingest` 和 `./kb extract` 都会自动优先使用它，不需要手工记 `PATH`。
+
+如果当前机器还没有 `markitdown` Python 包、`markitdown` CLI，或者本地运行环境，命令会显式失败，但仍保留请求与失败产物，便于排查。
+
+## 本地运行环境
+
+为了避免把依赖装到系统 Python，建议把 `markitdown` 装在仓库内的本地运行环境里。`./kb` 会自动识别并优先使用这个环境，所以通常不需要手工改 `PATH`。
+
+```bash
+cd /Users/wz/project/knowledge-base
+python3.11 -m venv output/runtime-markitdown
+output/runtime-markitdown/bin/pip install 'markitdown[pdf]'
+./kb extract /absolute/path/to/file.pdf --json
+```
+
+约定如下：
+
+- 这个运行环境只服务于 `knowledge-base` 的收录与离线提取
+- `./kb ingest` 和 `./kb extract` 都会优先使用该环境里的 `markitdown`
+- 如果环境里没有 `markitdown`，命令仍会显式失败，不会偷偷联网补救
+- 这个环境放在 `output/` 下，属于临时运行产物，不是正式知识
+
+可选的兼容包装命令是 `./kb-with-markitdown`，它只是薄封装，不是必需步骤。
 
 ## 维护原则
 
@@ -69,4 +140,3 @@ cd /Users/wz/project/knowledge-base
 5. `wiki/index.md`
 6. `wiki/overview.md`
 7. `wiki/log.md`
-

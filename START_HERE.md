@@ -28,6 +28,10 @@
 ## 当前默认动作
 
 - 查知识：优先 `./kb query`
+- 做文件入库：优先 `./kb ingest /absolute/path/to/file`
+- 文件型收录会先自动走本地 `markitdown` 转成 Markdown，再生成 ingest bundle 与 source draft
+- 做离线提取：优先 `./kb extract /absolute/path/to/file`
+- 做 PDF 或文件型离线提取：优先 `./kb extract /absolute/path/to/file`
 - 做维护：优先 `./kb maintain`
 - 补索引：优先 `./kb reindex --write`
 - 新增 canonical：补齐 `domain / industries / categories`
@@ -38,4 +42,3 @@
 - 不要跳过 domain registry 直接加新域
 - 不要把 reports、logs、output 当成 canonical truth
 - 不要开始飞书机器人接入
-

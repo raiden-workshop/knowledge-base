@@ -16,12 +16,15 @@ from pathlib import Path
 from typing import Iterable
 
 import kb_core
+import kb_extract_core
+import kb_ingest_core
 
 
 REPO_ROOT = Path(__file__).resolve().parent
 WIKI_ROOT = REPO_ROOT / "wiki"
 RAW_ROOT = REPO_ROOT / "raw"
 OUTPUT_ROOT = REPO_ROOT / "output"
+MARKITDOWN_RUNTIME_BIN = OUTPUT_ROOT / "runtime-markitdown" / "bin"
 INDEX_PATH = WIKI_ROOT / "index.md"
 LOG_PATH = WIKI_ROOT / "log.md"
 CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
@@ -202,6 +205,17 @@ def die(message: str, code: int = 1) -> None:
     raise SystemExit(code)
 
 
+def bootstrap_local_runtime() -> None:
+    if not MARKITDOWN_RUNTIME_BIN.is_dir():
+        return
+    runtime_bin = str(MARKITDOWN_RUNTIME_BIN)
+    current_path = os.environ.get("PATH", "")
+    segments = current_path.split(os.pathsep) if current_path else []
+    if runtime_bin in segments:
+        return
+    os.environ["PATH"] = os.pathsep.join([runtime_bin, current_path]) if current_path else runtime_bin
+
+
 def slugify(text: str) -> str:
     fragment = text.strip().lower()
     fragment = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "-", fragment)
@@ -235,8 +249,29 @@ def dump_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def snapshot_text_file(path: Path) -> tuple[Path, str | None]:
+    return path, load_text(path) if path.exists() else None
+
+
+def restore_text_snapshots(snapshots: list[tuple[Path, str | None]]) -> None:
+    for path, content in reversed(snapshots):
+        if content is None:
+            if path.exists():
+                path.unlink()
+            continue
+        kb_ingest_core.atomic_write_text(path, content)
+
+
 def repo_paths() -> kb_core.RepoPaths:
     return kb_core.build_repo_paths(REPO_ROOT, WIKI_ROOT, RAW_ROOT, OUTPUT_ROOT, PAGE_LAYOUT)
+
+
+def extract_paths() -> kb_extract_core.ExtractPaths:
+    return kb_extract_core.build_extract_paths(REPO_ROOT)
+
+
+def ingest_paths() -> kb_ingest_core.IngestPaths:
+    return kb_ingest_core.build_ingest_paths(REPO_ROOT, WIKI_ROOT, RAW_ROOT, OUTPUT_ROOT, PAGE_LAYOUT)
 
 
 def render_page(meta: dict, body: str) -> str:
@@ -314,6 +349,20 @@ def default_categories_for_kind(kind: str) -> list[str]:
 
 def default_raw_bucket(domain: str) -> Path:
     return RAW_ROOT / "domains" / domain
+
+
+def domain_registry_path(domain: str) -> Path:
+    return PAGE_LAYOUT["domain"]["dir"] / f"domain-{domain}.md"
+
+
+def domain_is_registered(domain: str) -> bool:
+    return domain_registry_path(domain).exists()
+
+
+def ensure_registered_domain(domain: str) -> None:
+    if domain_is_registered(domain):
+        return
+    die(f"domain `{domain}` is not registered in wiki/domains")
 
 
 def build_template(
@@ -472,6 +521,183 @@ def cmd_log(args: argparse.Namespace) -> int:
         return 0
     print(f"updated: {repo_rel(LOG_PATH)}")
     return 0
+
+
+def build_ingest_payload(record: kb_ingest_core.IngestRecord, action: str | None = None) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "ingest_id": record.manifest["ingest_id"],
+        "domain": record.manifest["domain"],
+        "target_type": record.manifest["target_type"],
+        "source_title": record.manifest["source_title"],
+        "source_locator": record.manifest["source_locator"],
+        "relation_type": record.manifest["relation_type"],
+        "duplicate_status": record.manifest["duplicate_status"],
+        "review_status": record.manifest["review_status"],
+        "related_pages": record.manifest["related_pages"],
+        "draft_bundle": repo_rel(record.draft_bundle.root_dir),
+        "draft_pages": [repo_rel(path) for path in record.draft_bundle.draft_pages],
+        "review_summary": repo_rel(record.draft_bundle.review_summary_path),
+        "log_entry": repo_rel(record.draft_bundle.log_entry_path),
+    }
+    for key in ("extraction_mode", "extractor_name", "extractor_version"):
+        value = record.manifest.get(key)
+        if value is not None:
+            payload[key] = value
+    duplicate_matches = record.manifest.get("duplicate_matches", [])
+    if isinstance(duplicate_matches, list):
+        payload["duplicate_matches"] = duplicate_matches
+    notes = record.manifest.get("notes", [])
+    if isinstance(notes, list):
+        payload["notes"] = notes
+    applied_pages = record.manifest.get("applied_pages", [])
+    if isinstance(applied_pages, list) and applied_pages:
+        payload["applied_pages"] = applied_pages
+    if action:
+        payload["action"] = action
+    return payload
+
+
+def render_ingest_summary(record: kb_ingest_core.IngestRecord, as_json: bool, action: str | None = None) -> str:
+    payload = build_ingest_payload(record, action=action)
+    if as_json:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    lines = [
+        f"ingest_id: {payload['ingest_id']}",
+        f"- source_title: {payload['source_title']}",
+        f"- target_type: {payload['target_type']}",
+        f"- relation_type: {payload['relation_type']}",
+        f"- duplicate_status: {payload['duplicate_status']}",
+        f"- review_status: {payload['review_status']}",
+        f"- extraction_mode: {payload.get('extraction_mode', 'n/a')}",
+        f"- extractor: {payload.get('extractor_name', 'n/a')}@{payload.get('extractor_version', 'n/a')}",
+        f"- draft_bundle: {payload['draft_bundle']}",
+    ]
+    draft_pages = payload.get("draft_pages", [])
+    if isinstance(draft_pages, list) and draft_pages:
+        lines.append("- draft_pages:")
+        lines.extend(f"  - {item}" for item in draft_pages)
+    related_pages = payload.get("related_pages", [])
+    if isinstance(related_pages, list) and related_pages:
+        lines.append("- related_pages:")
+        lines.extend(f"  - {item}" for item in related_pages)
+    duplicate_matches = payload.get("duplicate_matches", [])
+    if isinstance(duplicate_matches, list) and duplicate_matches:
+        lines.append("- duplicate_matches:")
+        for item in duplicate_matches:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"  - {item.get('reason', 'match')}: {item.get('page_path') or item.get('manifest_path') or 'n/a'}")
+    notes = payload.get("notes", [])
+    if isinstance(notes, list) and notes:
+        lines.append("- notes:")
+        lines.extend(f"  - {item}" for item in notes)
+    if action:
+        lines.append(f"- action: {action}")
+    return "\n".join(lines)
+
+
+def cmd_ingest(args: argparse.Namespace) -> int:
+    domain = kb_core.normalize_tag_value(getattr(args, "domain", None) or FOUNDING_DOMAIN)
+    if not domain:
+        die("domain must not be empty")
+    ensure_registered_domain(domain)
+    industries = normalize_metadata_list(getattr(args, "industry", None), default=FOUNDING_INDUSTRIES)
+    categories = normalize_metadata_list(getattr(args, "category", None), default=default_categories_for_kind("source"))
+    try:
+        record = kb_ingest_core.ingest_target(
+            paths=ingest_paths(),
+            target=args.target,
+            domain=domain,
+            industries=industries,
+            categories=categories,
+            source_title=args.title,
+            allow_duplicate=args.allow_duplicate,
+            now_iso=timestamp_str(),
+            today=today_str(),
+        )
+    except ValueError as exc:
+        die(str(exc))
+    print(render_ingest_summary(record, args.json))
+    return 0
+
+
+def cmd_ingest_review(args: argparse.Namespace) -> int:
+    try:
+        if args.apply:
+            preview_record = kb_ingest_core.load_ingest_record(ingest_paths(), args.ingest_id)
+            action_name, summary, notes = kb_ingest_core.parse_log_entry(preview_record.draft_bundle.log_entry_path)
+            if not INDEX_PATH.exists():
+                raise ValueError(f"index file missing: {repo_rel(INDEX_PATH)}")
+            if not LOG_PATH.exists():
+                raise ValueError(f"log file missing: {repo_rel(LOG_PATH)}")
+            apply_plan = kb_ingest_core.build_apply_plan(
+                ingest_paths(),
+                args.ingest_id,
+                today=today_str(),
+                applied_at=timestamp_str(),
+            )
+            snapshots = [snapshot_text_file(path) for path in [*apply_plan.applied_paths, INDEX_PATH, LOG_PATH, apply_plan.record.manifest_path]]
+            try:
+                for destination, content in apply_plan.rendered_pages:
+                    kb_ingest_core.atomic_write_text(destination, content)
+                for path in apply_plan.applied_paths:
+                    ensure_index_entry(path)
+                write_log_entry(action_name, summary, notes, dry_run=False)
+                kb_ingest_core.atomic_write_json(apply_plan.record.manifest_path, apply_plan.updated_manifest)
+            except Exception as exc:
+                restore_text_snapshots(snapshots)
+                if isinstance(exc, ValueError):
+                    raise
+                raise ValueError(str(exc)) from exc
+            record = kb_ingest_core.load_ingest_record(ingest_paths(), args.ingest_id)
+            rendered_action = "applied"
+        elif args.reject:
+            record = kb_ingest_core.reject_ingest_record(ingest_paths(), args.ingest_id)
+            rendered_action = "rejected"
+        else:
+            record = kb_ingest_core.load_ingest_record(ingest_paths(), args.ingest_id)
+            rendered_action = None
+    except ValueError as exc:
+        die(str(exc))
+    print(render_ingest_summary(record, args.json, action=rendered_action))
+    return 0
+
+
+def render_extract_summary(outcome: kb_extract_core.ExtractOutcome, as_json: bool) -> str:
+    payload = {
+        "request_id": outcome.request_id,
+        "extractor_name": outcome.extractor_name,
+        "extractor_version": outcome.extractor_version,
+        "extract_status": outcome.extract_status,
+        "extract_error": outcome.extract_error,
+        "request_artifact": repo_rel(outcome.request_path),
+        "result_artifact": repo_rel(outcome.result_path),
+        "content_artifact": repo_rel(outcome.content_path),
+    }
+    if as_json:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    lines = [
+        f"request_id: {payload['request_id']}",
+        f"- extractor: {payload['extractor_name']}@{payload['extractor_version']}",
+        f"- extract_status: {payload['extract_status']}",
+        f"- request_artifact: {payload['request_artifact']}",
+        f"- result_artifact: {payload['result_artifact']}",
+        f"- content_artifact: {payload['content_artifact']}",
+    ]
+    if payload["extract_error"]:
+        lines.append(f"- extract_error: {payload['extract_error']}")
+    return "\n".join(lines)
+
+
+def cmd_extract_offline(args: argparse.Namespace) -> int:
+    outcome = kb_extract_core.execute_extract(
+        extract_paths(),
+        source_path=args.source_path,
+        request_id=args.request_id,
+    )
+    print(render_extract_summary(outcome, args.json))
+    return 0 if outcome.extract_status in {"succeeded", "low_confidence"} else 1
 
 
 def extract_markdown_links(page: Page) -> list[tuple[str, Path]]:
@@ -2125,6 +2351,37 @@ def build_parser() -> argparse.ArgumentParser:
     log_parser.add_argument("--dry-run", action="store_true")
     log_parser.set_defaults(func=cmd_log)
 
+    ingest_parser = subparsers.add_parser(
+        "ingest",
+        help="Create an ingest bundle and source draft for a URL or local file after local MarkItDown conversion",
+    )
+    ingest_parser.add_argument("target", help="URL or local file path to ingest")
+    ingest_parser.add_argument("--domain", default=FOUNDING_DOMAIN, help="Owning domain slug for the ingest bundle")
+    ingest_parser.add_argument("--industry", action="append", help="Industry tag; repeat for multiple values")
+    ingest_parser.add_argument("--category", action="append", help="Category tag; repeat for multiple values")
+    ingest_parser.add_argument("--title", help="Override the inferred source title")
+    ingest_parser.add_argument("--allow-duplicate", action="store_true", help="Allow duplicate-like ingests to proceed to review instead of blocking apply")
+    ingest_parser.add_argument("--json", action="store_true", help="Render machine-readable ingest output")
+    ingest_parser.set_defaults(func=cmd_ingest)
+
+    ingest_review_parser = subparsers.add_parser("ingest-review", help="Inspect, apply, or reject an ingest draft bundle")
+    ingest_review_parser.add_argument("ingest_id")
+    ingest_review_action = ingest_review_parser.add_mutually_exclusive_group()
+    ingest_review_action.add_argument("--apply", action="store_true", help="Promote the draft bundle into wiki/")
+    ingest_review_action.add_argument("--reject", action="store_true", help="Reject the draft bundle but keep evidence")
+    ingest_review_parser.add_argument("--json", action="store_true", help="Render machine-readable review output")
+    ingest_review_parser.set_defaults(func=cmd_ingest_review)
+
+    extract_parser = subparsers.add_parser(
+        "extract-offline",
+        aliases=["extract"],
+        help="Run the same local MarkItDown extraction backend used by ingest and write artifacts",
+    )
+    extract_parser.add_argument("source_path", help="Local file path to extract")
+    extract_parser.add_argument("--request-id", help="Optional stable request id override")
+    extract_parser.add_argument("--json", action="store_true", help="Render machine-readable extraction output")
+    extract_parser.set_defaults(func=cmd_extract_offline)
+
     maintain_parser = subparsers.add_parser("maintain", aliases=["lint", "check"], help="Run lightweight maintenance checks")
     maintain_parser.add_argument("--write-report", action="store_true")
     maintain_parser.add_argument("--json", action="store_true", help="Render machine-readable maintenance output")
@@ -2163,6 +2420,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Iterable[str] | None = None) -> int:
+    bootstrap_local_runtime()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)
