@@ -28,6 +28,7 @@
 ## Working Rules
 
 - raw 必须进 `raw/domains/<domain>/...`
+- 离线提取中间产物默认进 `artifacts/extract/<request_id>/...`
 - canonical page 必须有 `domain / industries / categories`
 - canonical 变更同时更新 `wiki/index.md` 和 `wiki/log.md`
 - `wiki/reports/` 只放检查与治理结果，不承担正式知识
@@ -45,4 +46,7 @@
 ## Next Safe Action
 
 - 日常查询或改动前先跑 `./kb maintain`
-
+- 若先处理外部本地文件，优先从 `./kb extract /absolute/path/to/file` 开始
+- 若要跑 PDF 等文件型离线提取，直接使用 `./kb extract /absolute/path/to/file`
+- `./kb` 会自动使用仓库内的 `output/runtime-markitdown` 本地运行环境；这不是全局自动化，而是仓库内的执行约定
+- `./kb-with-markitdown` 只是可选兼容层，不是必需步骤
