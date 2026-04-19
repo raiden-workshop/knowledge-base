@@ -539,7 +539,7 @@ def build_ingest_payload(record: kb_ingest_core.IngestRecord, action: str | None
         "review_summary": repo_rel(record.draft_bundle.review_summary_path),
         "log_entry": repo_rel(record.draft_bundle.log_entry_path),
     }
-    for key in ("extraction_mode", "extractor_name", "extractor_version"):
+    for key in ("extraction_mode", "extractor_name", "extractor_version", "ocr_applied", "ocr_engine", "ocr_languages"):
         value = record.manifest.get(key)
         if value is not None:
             payload[key] = value
@@ -571,8 +571,13 @@ def render_ingest_summary(record: kb_ingest_core.IngestRecord, as_json: bool, ac
         f"- review_status: {payload['review_status']}",
         f"- extraction_mode: {payload.get('extraction_mode', 'n/a')}",
         f"- extractor: {payload.get('extractor_name', 'n/a')}@{payload.get('extractor_version', 'n/a')}",
+        f"- ocr_applied: {payload.get('ocr_applied', False)}",
         f"- draft_bundle: {payload['draft_bundle']}",
     ]
+    if payload.get("ocr_engine"):
+        lines.append(f"- ocr_engine: {payload['ocr_engine']}")
+    if payload.get("ocr_languages"):
+        lines.append(f"- ocr_languages: {payload['ocr_languages']}")
     draft_pages = payload.get("draft_pages", [])
     if isinstance(draft_pages, list) and draft_pages:
         lines.append("- draft_pages:")
@@ -667,8 +672,13 @@ def cmd_ingest_review(args: argparse.Namespace) -> int:
 def render_extract_summary(outcome: kb_extract_core.ExtractOutcome, as_json: bool) -> str:
     payload = {
         "request_id": outcome.request_id,
+        "extraction_mode": outcome.extraction_mode,
         "extractor_name": outcome.extractor_name,
         "extractor_version": outcome.extractor_version,
+        "ocr_applied": outcome.ocr_applied,
+        "ocr_engine": outcome.ocr_engine,
+        "ocr_languages": outcome.ocr_languages,
+        "notes": outcome.notes,
         "extract_status": outcome.extract_status,
         "extract_error": outcome.extract_error,
         "request_artifact": repo_rel(outcome.request_path),
@@ -679,12 +689,21 @@ def render_extract_summary(outcome: kb_extract_core.ExtractOutcome, as_json: boo
         return json.dumps(payload, ensure_ascii=False, indent=2)
     lines = [
         f"request_id: {payload['request_id']}",
+        f"- extraction_mode: {payload['extraction_mode']}",
         f"- extractor: {payload['extractor_name']}@{payload['extractor_version']}",
+        f"- ocr_applied: {payload['ocr_applied']}",
         f"- extract_status: {payload['extract_status']}",
         f"- request_artifact: {payload['request_artifact']}",
         f"- result_artifact: {payload['result_artifact']}",
         f"- content_artifact: {payload['content_artifact']}",
     ]
+    if payload["ocr_engine"]:
+        lines.append(f"- ocr_engine: {payload['ocr_engine']}")
+    if payload["ocr_languages"]:
+        lines.append(f"- ocr_languages: {payload['ocr_languages']}")
+    if payload["notes"]:
+        lines.append("- notes:")
+        lines.extend(f"  - {item}" for item in payload["notes"])
     if payload["extract_error"]:
         lines.append(f"- extract_error: {payload['extract_error']}")
     return "\n".join(lines)

@@ -29,7 +29,7 @@
 
 - 查知识：优先 `./kb query`
 - 做文件入库：优先 `./kb ingest /absolute/path/to/file`
-- 文件型收录会先自动走本地 `markitdown` 转成 Markdown，再生成 ingest bundle 与 source draft
+- 文件型收录会先自动走本地 `markitdown` 转成 Markdown；弱文本 PDF 在本机存在 `ocrmypdf` 时会自动补一次本地 OCR fallback
 - 做离线提取：优先 `./kb extract /absolute/path/to/file`
 - 做 PDF 或文件型离线提取：优先 `./kb extract /absolute/path/to/file`
 - 做维护：优先 `./kb maintain`

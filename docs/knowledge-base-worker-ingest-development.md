@@ -194,6 +194,7 @@ Phase D：文档与人工流程对齐
 - DOCX / ODT
 - PDF，经本地 `markitdown` 提取
 - 图片，经本地 `markitdown` 提取但不启用 OCR 增强
+- PDF 弱文本时，若本机存在 `ocrmypdf`，会先补一次本地 OCR fallback，再重新走 `markitdown`
 
 关系类型：
 
@@ -226,7 +227,7 @@ review 行为：
 主要风险如下。
 
 - URL 内容质量差异大，HTTP 抓取结果不稳定
-- 本地 `markitdown` 对扫描件、图片或结构复杂文档可能只产出弱文本
+- 本地 `markitdown` 对扫描件、图片或结构复杂文档可能只产出弱文本；当前仅对弱文本 PDF 增加本地 `ocrmypdf` fallback
 - supplement 与 conflict 的判断可能被过度自动化
 - apply 若非原子，容易把 draft 和 canonical 弄混
 

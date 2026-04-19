@@ -82,6 +82,7 @@ cd /Users/wz/project/knowledge-base
 
 - 只支持本地文件路径
 - 默认只使用本地 `MarkItDown` 基础转换能力
+- 对弱文本 PDF，会在本机存在 `ocrmypdf` 时自动尝试一次本地 OCR fallback
 - 不允许 `llm_client`
 - 不允许 `markitdown-ocr`
 - 不允许 Azure Document Intelligence
@@ -102,6 +103,7 @@ cd /Users/wz/project/knowledge-base
 依赖说明：
 
 - 当前机器需要可用的 `markitdown` Python 包或 `markitdown` CLI
+- 若希望弱文本 PDF 自动补 OCR，当前机器还需要可用的 `ocrmypdf` CLI
 - 若依赖缺失，命令会显式失败并返回 `markitdown unavailable`
 
 本地运行环境示例：
@@ -110,6 +112,7 @@ cd /Users/wz/project/knowledge-base
 cd /Users/wz/project/knowledge-base
 python3.11 -m venv output/runtime-markitdown
 output/runtime-markitdown/bin/pip install 'markitdown[pdf]'
+brew install ocrmypdf
 ./kb extract /absolute/path/to/file.pdf --json
 ```
 
@@ -127,8 +130,9 @@ output/runtime-markitdown/bin/pip install 'markitdown[pdf]'
 当前固定行为：
 
 - 文件型收录会先自动调用本地 `markitdown`
+- 对弱文本 PDF，会在本机存在 `ocrmypdf` 时自动尝试一次本地 OCR fallback，再重新走 `markitdown`
 - 转换结果会落到本次 bundle 的 `extracted.md`
-- `manifest.json` 会记录 `extraction_mode / extractor_name / extractor_version`
+- `manifest.json` 会记录 `extraction_mode / extractor_name / extractor_version / ocr_applied / ocr_engine / ocr_languages`
 - 如果本地 `markitdown` 不可用或转换失败，命令会显式失败
 - URL 正文过弱时仍会进入 `needs_browser_capture`
 

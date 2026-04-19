@@ -48,6 +48,6 @@
 - 日常查询或改动前先跑 `./kb maintain`
 - 若要把外部本地文件正式收进知识库，优先直接使用 `./kb ingest /absolute/path/to/file`
 - 若只想单独验证提取质量，再使用 `./kb extract /absolute/path/to/file`
-- 文件型 `ingest` 会先自动走本地 `markitdown` 转成 Markdown，再生成 ingest bundle 与 source draft
+- 文件型 `ingest` 会先自动走本地 `markitdown` 转成 Markdown；弱文本 PDF 在本机存在 `ocrmypdf` 时会自动补一次本地 OCR fallback
 - `./kb` 会自动使用仓库内的 `output/runtime-markitdown` 本地运行环境；这不是全局自动化，而是仓库内的执行约定
 - `./kb-with-markitdown` 只是可选兼容层，不是必需步骤

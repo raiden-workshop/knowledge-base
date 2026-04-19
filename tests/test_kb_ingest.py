@@ -70,6 +70,26 @@ class _FakeAdapterWeirdTitle:
         )
 
 
+class _FakeAdapterOcrSuccess:
+    def convert_file(self, source_path: Path):
+        from kb_markitdown import MarkItDownResult
+
+        return MarkItDownResult(
+            markdown_content=(
+                "# OCR Success\n\n"
+                "This OCR-enriched markdown body is intentionally long enough to clear weak-content checks.\n"
+                "It represents a scanned PDF that became readable after the local OCR fallback.\n"
+            ),
+            extractor_name="markitdown",
+            extractor_version="test",
+            extraction_mode="markitdown-local+ocrmypdf",
+            ocr_applied=True,
+            ocr_engine="ocrmypdf+tesseract",
+            ocr_languages="chi_sim+eng",
+            notes=("Local PDF OCR fallback applied before the final MarkItDown conversion.",),
+        )
+
+
 class KBIngestTests(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
@@ -327,6 +347,27 @@ class KBIngestTests(unittest.TestCase):
         extracted_body = extracted_path.read_text(encoding="utf-8")
         self.assertIn("- Extraction mode: `markitdown-local`", extracted_body)
         self.assertIn("- Extractor: `markitdown@test`", extracted_body)
+
+    def test_ingest_records_local_ocr_metadata_for_weak_pdf_fallbacks(self):
+        self.module.kb_ingest_core.MarkItDownOfflineAdapter = _FakeAdapterOcrSuccess
+        source_path = self.write_input("ocr.pdf", "%PDF-1.4 fake scanned payload")
+
+        exit_code, output = self.run_ingest(source_path, title="OCR PDF")
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("- review_status: ready_for_review", output)
+        self.assertIn("- ocr_applied: True", output)
+        manifest = self.latest_manifest()
+        self.assertEqual(manifest["extraction_mode"], "markitdown-local+ocrmypdf")
+        self.assertEqual(manifest["ocr_applied"], True)
+        self.assertEqual(manifest["ocr_engine"], "ocrmypdf+tesseract")
+        self.assertEqual(manifest["ocr_languages"], "chi_sim+eng")
+        self.assertTrue(manifest["notes"])
+        extracted_body = (self.repo_root / manifest["extracted_file"]).read_text(encoding="utf-8")
+        self.assertIn("- OCR applied: `yes`", extracted_body)
+        self.assertIn("- OCR engine: `ocrmypdf+tesseract`", extracted_body)
+        review_summary = (self.repo_root / manifest["draft_bundle"] / "review-summary.md").read_text(encoding="utf-8")
+        self.assertIn("- OCR applied: `yes`", review_summary)
 
     def test_local_file_title_defaults_to_filename_not_markitdown_heading(self):
         self.module.kb_ingest_core.MarkItDownOfflineAdapter = _FakeAdapterWeirdTitle

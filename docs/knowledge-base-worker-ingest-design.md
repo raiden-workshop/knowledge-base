@@ -125,7 +125,7 @@ v1 支持以下输入类型：
 - URL：先做 HTTP 采集并落本地原件，再优先走本地 `markitdown`；正文质量不足、需要登录、抓不到主内容或反爬明显时走浏览器回退
 - 文本类文件：保留原件，并先走本地 `markitdown` 生成提取稿
 - Word 类文件：保留原件，并先走本地 `markitdown` 生成提取稿
-- PDF：保留原件，并先走本地 `markitdown` 生成提取稿
+- PDF：保留原件，并先走本地 `markitdown` 生成提取稿；若结果明显偏弱且本机存在 `ocrmypdf`，则先做本地 OCR fallback，再重新走 `markitdown`
 - 图片：保留原件，并先走本地 `markitdown`；当前不启用 OCR 增强
 
 保留策略固定为“原件 + 提取稿”双保留：
@@ -280,7 +280,7 @@ reject 契约固定如下：
 - URL 抓不到正文：标记 `needs_browser_capture`
 - 浏览器回退后仍无法提取有效文本：保留原件并进入人工 review，不自动派生高层页
 - 文件类型不支持：直接失败并说明原因
-- 本地 `markitdown` 转换质量过弱：只允许生成 `source` 草稿，不自动更新高层页
+- 本地 `markitdown` 转换质量过弱：对 PDF 可先尝试本地 `ocrmypdf` fallback；若仍过弱，只允许生成 `source` 草稿，不自动更新高层页
 - 本地 `markitdown` 不可用或转换失败：本次 ingest 显式失败，不做静默回退
 - 关系类型判断不稳定：默认降级为 `new` 或 `supplement` review，不直接走 conflict apply
 - apply 校验失败：拒绝进入 `wiki/`

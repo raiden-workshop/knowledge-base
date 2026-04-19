@@ -70,12 +70,14 @@ cd /Users/wz/project/knowledge-base
 约束固定如下：
 
 - 本地文件和可落地为文件的 URL，都先走本地 `markitdown`
+- 对弱文本 PDF，会在本机存在 `ocrmypdf` 时自动尝试一次本地 OCR fallback，再重新走 `markitdown`
 - 不调用外部 API
 - 不启用 `llm_client`
 - 不启用 `markitdown-ocr`
 - 不使用 Azure Document Intelligence
 - 如果本地 `markitdown` 不可用或转换失败，`ingest` 会显式失败，不会静默回退到旧提取器
-- `manifest.json` 会记录 `extraction_mode / extractor_name / extractor_version`
+- 如果本机没有 `ocrmypdf`，弱文本 PDF 会保留原始弱提取结果，并在 `notes` 中记录原因
+- `manifest.json` 会记录 `extraction_mode / extractor_name / extractor_version / ocr_applied / ocr_engine / ocr_languages`
 
 ## 离线提取
 
@@ -89,6 +91,7 @@ cd /Users/wz/project/knowledge-base
 
 - 只支持本地文件输入
 - 默认复用与 `ingest` 相同的本地 `MarkItDown` 基础转换能力
+- 对弱文本 PDF，会在本机存在 `ocrmypdf` 时自动尝试一次本地 OCR fallback
 - 不调用外部 API
 - 不启用 `llm_client`
 - 不启用 `markitdown-ocr`
@@ -104,6 +107,8 @@ cd /Users/wz/project/knowledge-base
 
 如果当前机器还没有 `markitdown` Python 包、`markitdown` CLI，或者本地运行环境，命令会显式失败，但仍保留请求与失败产物，便于排查。
 
+如果你希望启用本地 PDF OCR fallback，推荐先让当前机器具备 `ocrmypdf` CLI。当前实现只会在 PDF 提取明显偏弱时才尝试 OCR，不会给所有 PDF 一刀切加慢路径。
+
 ## 本地运行环境
 
 为了避免把依赖装到系统 Python，建议把 `markitdown` 装在仓库内的本地运行环境里。`./kb` 会自动识别并优先使用这个环境，所以通常不需要手工改 `PATH`。
@@ -112,6 +117,7 @@ cd /Users/wz/project/knowledge-base
 cd /Users/wz/project/knowledge-base
 python3.11 -m venv output/runtime-markitdown
 output/runtime-markitdown/bin/pip install 'markitdown[pdf]'
+brew install ocrmypdf
 ./kb extract /absolute/path/to/file.pdf --json
 ```
 
@@ -119,6 +125,7 @@ output/runtime-markitdown/bin/pip install 'markitdown[pdf]'
 
 - 这个运行环境只服务于 `knowledge-base` 的收录与离线提取
 - `./kb ingest` 和 `./kb extract` 都会优先使用该环境里的 `markitdown`
+- 若本机 PATH 上存在 `ocrmypdf`，弱文本 PDF 会自动尝试本地 OCR fallback
 - 如果环境里没有 `markitdown`，命令仍会显式失败，不会偷偷联网补救
 - 这个环境放在 `output/` 下，属于临时运行产物，不是正式知识
 

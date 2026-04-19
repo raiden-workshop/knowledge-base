@@ -32,8 +32,13 @@ class ExtractOutcome:
     request_id: str
     extract_status: str
     extract_error: str | None
+    extraction_mode: str
     extractor_name: str
     extractor_version: str
+    ocr_applied: bool
+    ocr_engine: str | None
+    ocr_languages: str | None
+    notes: list[str]
     request_path: Path
     result_path: Path
     content_path: Path
@@ -106,8 +111,13 @@ def execute_extract(
 
     extracting_payload = {
         "request_id": request_key,
+        "extraction_mode": "markitdown-local",
         "extractor_name": "markitdown",
         "extractor_version": "unknown",
+        "ocr_applied": False,
+        "ocr_engine": None,
+        "ocr_languages": None,
+        "notes": [],
         "extract_status": "extracting",
         "extract_error": None,
         "extracted_at": now_iso(),
@@ -142,8 +152,13 @@ def execute_extract(
     atomic_write_text(artifacts.content_path, markdown)
     result_payload = {
         "request_id": request_key,
+        "extraction_mode": converted.extraction_mode,
         "extractor_name": converted.extractor_name,
         "extractor_version": converted.extractor_version,
+        "ocr_applied": converted.ocr_applied,
+        "ocr_engine": converted.ocr_engine,
+        "ocr_languages": converted.ocr_languages,
+        "notes": list(converted.notes),
         "extract_status": status,
         "extract_error": error_text,
         "extracted_at": now_iso(),
@@ -153,8 +168,13 @@ def execute_extract(
         request_id=request_key,
         extract_status=status,
         extract_error=error_text,
+        extraction_mode=converted.extraction_mode,
         extractor_name=converted.extractor_name,
         extractor_version=converted.extractor_version,
+        ocr_applied=converted.ocr_applied,
+        ocr_engine=converted.ocr_engine,
+        ocr_languages=converted.ocr_languages,
+        notes=list(converted.notes),
         request_path=artifacts.request_path,
         result_path=artifacts.result_path,
         content_path=artifacts.content_path,
@@ -165,8 +185,13 @@ def finalize_failed(artifacts: ExtractArtifacts, *, request_id: str, error: str)
     atomic_write_text(artifacts.content_path, "")
     payload = {
         "request_id": request_id,
+        "extraction_mode": "markitdown-local",
         "extractor_name": "markitdown",
         "extractor_version": "unknown",
+        "ocr_applied": False,
+        "ocr_engine": None,
+        "ocr_languages": None,
+        "notes": [],
         "extract_status": "failed",
         "extract_error": error,
         "extracted_at": now_iso(),
@@ -176,8 +201,13 @@ def finalize_failed(artifacts: ExtractArtifacts, *, request_id: str, error: str)
         request_id=request_id,
         extract_status="failed",
         extract_error=error,
+        extraction_mode="markitdown-local",
         extractor_name="markitdown",
         extractor_version="unknown",
+        ocr_applied=False,
+        ocr_engine=None,
+        ocr_languages=None,
+        notes=[],
         request_path=artifacts.request_path,
         result_path=artifacts.result_path,
         content_path=artifacts.content_path,
@@ -194,4 +224,3 @@ def is_low_confidence(markdown: str) -> bool:
         return True
     words = [part for part in plain.split(" ") if part]
     return len(words) < 8
-

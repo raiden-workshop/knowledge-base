@@ -53,6 +53,22 @@ class _FakeAdapterLowConfidence:
         )
 
 
+class _FakeAdapterOcrSuccess:
+    def convert_file(self, source_path: Path):
+        from kb_markitdown import MarkItDownResult
+
+        return MarkItDownResult(
+            markdown_content="# OCR Sample\n\nThis OCR extraction has enough text to be treated as strong content in tests.",
+            extractor_name="markitdown",
+            extractor_version="test",
+            extraction_mode="markitdown-local+ocrmypdf",
+            ocr_applied=True,
+            ocr_engine="ocrmypdf+tesseract",
+            ocr_languages="chi_sim+eng",
+            notes=("Local PDF OCR fallback applied before the final MarkItDown conversion.",),
+        )
+
+
 class KBExtractTests(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
@@ -111,7 +127,23 @@ class KBExtractTests(unittest.TestCase):
         self.assertEqual(set(request_payload.keys()) >= {"request_id", "source_type", "source_path", "requested_at"}, True)
 
         result_payload = json.loads((artifact_dir / "result.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(result_payload.keys()) >= {"request_id", "extractor_name", "extractor_version", "extract_status", "extract_error", "extracted_at"}, True)
+        self.assertEqual(
+            set(result_payload.keys())
+            >= {
+                "request_id",
+                "extraction_mode",
+                "extractor_name",
+                "extractor_version",
+                "ocr_applied",
+                "ocr_engine",
+                "ocr_languages",
+                "notes",
+                "extract_status",
+                "extract_error",
+                "extracted_at",
+            },
+            True,
+        )
 
     def test_missing_path_fails_explicitly(self):
         missing = self.incoming / "does-not-exist.md"
@@ -135,6 +167,24 @@ class KBExtractTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["extract_status"], "low_confidence")
         self.assertTrue(payload["extract_error"])
+
+    def test_extract_propagates_local_ocr_metadata(self):
+        original_adapter = self.module.kb_extract_core.MarkItDownOfflineAdapter
+        self.module.kb_extract_core.MarkItDownOfflineAdapter = _FakeAdapterOcrSuccess
+        try:
+            source = self.incoming / "ocr.pdf"
+            write_text(source, "%PDF-1.4 fake payload")
+            exit_code, output = self.run_extract(source, as_json=True)
+        finally:
+            self.module.kb_extract_core.MarkItDownOfflineAdapter = original_adapter
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(output)
+        self.assertEqual(payload["extraction_mode"], "markitdown-local+ocrmypdf")
+        self.assertEqual(payload["ocr_applied"], True)
+        self.assertEqual(payload["ocr_engine"], "ocrmypdf+tesseract")
+        self.assertEqual(payload["ocr_languages"], "chi_sim+eng")
+        self.assertTrue(payload["notes"])
 
     def test_same_request_id_is_predictable_and_reproducible(self):
         original_adapter = self.module.kb_extract_core.MarkItDownOfflineAdapter
@@ -176,4 +226,3 @@ class KBExtractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

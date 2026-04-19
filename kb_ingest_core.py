@@ -84,6 +84,9 @@ class ExtractionResult:
     extraction_mode: str
     extractor_name: str
     extractor_version: str
+    ocr_applied: bool
+    ocr_engine: str | None
+    ocr_languages: str | None
     title_hint: str
     notes: list[str]
     needs_browser_capture: bool
@@ -476,6 +479,9 @@ def ingest_target(
             extraction_mode=extraction.extraction_mode,
             extractor_name=extraction.extractor_name,
             extractor_version=extraction.extractor_version,
+            ocr_applied=extraction.ocr_applied,
+            ocr_engine=extraction.ocr_engine,
+            ocr_languages=extraction.ocr_languages,
             related_pages=related_pages,
             original_path=original_path,
             extracted_path=extracted_path,
@@ -508,6 +514,9 @@ def ingest_target(
             "extraction_mode": extraction.extraction_mode,
             "extractor_name": extraction.extractor_name,
             "extractor_version": extraction.extractor_version,
+            "ocr_applied": extraction.ocr_applied,
+            "ocr_engine": extraction.ocr_engine,
+            "ocr_languages": extraction.ocr_languages,
             "extraction_quality": "weak" if extraction.weak_text else "strong",
             "created_at": timestamp,
             "updated_at": timestamp,
@@ -564,13 +573,13 @@ def extract_content(target: IngestTarget, original_path: Path, content_type: str
         raise ValueError(f"unsupported ingest target type: {suffix or 'unknown'}")
 
     notes: list[str] = []
-    extraction_mode = "markitdown-local"
     adapter = MarkItDownOfflineAdapter()
     try:
         converted = adapter.convert_file(original_path.resolve())
     except Exception as exc:
         raise ValueError(f"local markitdown conversion failed for {original_path.name}: {exc}") from exc
 
+    notes.extend(list(converted.notes))
     extracted_markdown_body = converted.markdown_content.strip()
     title_hint = markdown_title_hint(extracted_markdown_body)
     extracted_text = markdown_to_text(extracted_markdown_body)
@@ -588,15 +597,21 @@ def extract_content(target: IngestTarget, original_path: Path, content_type: str
         extracted_markdown=render_extracted_markdown(
             source_locator=target.source_locator,
             title_hint=title_hint,
-            extraction_mode=extraction_mode,
+            extraction_mode=converted.extraction_mode,
             extractor_name=converted.extractor_name,
             extractor_version=converted.extractor_version,
+            ocr_applied=converted.ocr_applied,
+            ocr_engine=converted.ocr_engine,
+            ocr_languages=converted.ocr_languages,
             extracted_markdown=extracted_markdown_body,
             notes=notes,
         ),
-        extraction_mode=extraction_mode,
+        extraction_mode=converted.extraction_mode,
         extractor_name=converted.extractor_name,
         extractor_version=converted.extractor_version,
+        ocr_applied=converted.ocr_applied,
+        ocr_engine=converted.ocr_engine,
+        ocr_languages=converted.ocr_languages,
         title_hint=title_hint,
         notes=notes,
         needs_browser_capture=needs_browser_capture,
@@ -781,6 +796,9 @@ def render_extracted_markdown(
     extraction_mode: str,
     extractor_name: str,
     extractor_version: str,
+    ocr_applied: bool,
+    ocr_engine: str | None,
+    ocr_languages: str | None,
     extracted_markdown: str,
     notes: list[str],
 ) -> str:
@@ -793,7 +811,12 @@ def render_extracted_markdown(
         f"- Title hint: `{title_hint or 'n/a'}`",
         f"- Extraction mode: `{extraction_mode}`",
         f"- Extractor: `{extractor_name}@{extractor_version}`",
+        f"- OCR applied: `{'yes' if ocr_applied else 'no'}`",
     ]
+    if ocr_engine:
+        lines.append(f"- OCR engine: `{ocr_engine}`")
+    if ocr_languages:
+        lines.append(f"- OCR languages: `{ocr_languages}`")
     if notes:
         lines.append("- Notes:")
         lines.extend(f"  - {item}" for item in notes)
@@ -1037,6 +1060,9 @@ def render_review_summary(
     extraction_mode: str,
     extractor_name: str,
     extractor_version: str,
+    ocr_applied: bool,
+    ocr_engine: str | None,
+    ocr_languages: str | None,
     duplicate_matches: list[dict[str, object]],
     related_pages: list[str],
     draft_pages: list[str],
@@ -1052,10 +1078,19 @@ def render_review_summary(
         f"- Review status: `{review_status}`",
         f"- Extraction mode: `{extraction_mode}`",
         f"- Extractor: `{extractor_name}@{extractor_version}`",
-        "",
-        "## Duplicate Detection",
-        "",
     ]
+    if ocr_engine:
+        lines.append(f"- OCR engine: `{ocr_engine}`")
+    if ocr_languages:
+        lines.append(f"- OCR languages: `{ocr_languages}`")
+    lines.extend(
+        [
+            f"- OCR applied: `{'yes' if ocr_applied else 'no'}`",
+            "",
+            "## Duplicate Detection",
+            "",
+        ]
+    )
     if duplicate_matches:
         lines.extend(
             f"- `{item['reason']}` -> {item.get('page_path') or item.get('manifest_path') or 'n/a'}"
@@ -1113,6 +1148,9 @@ def write_draft_bundle(
     extraction_mode: str,
     extractor_name: str,
     extractor_version: str,
+    ocr_applied: bool,
+    ocr_engine: str | None,
+    ocr_languages: str | None,
     related_pages: list[str],
     original_path: Path,
     extracted_path: Path,
@@ -1159,6 +1197,9 @@ def write_draft_bundle(
             extraction_mode=extraction_mode,
             extractor_name=extractor_name,
             extractor_version=extractor_version,
+            ocr_applied=ocr_applied,
+            ocr_engine=ocr_engine,
+            ocr_languages=ocr_languages,
             duplicate_matches=duplicate_matches,
             related_pages=related_pages,
             draft_pages=draft_repo_paths,
