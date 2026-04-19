@@ -126,3 +126,7 @@ related:
 
 - Accepted output/ingest-drafts/20260419T123816611810-一万字提示词-10个文件-给你的-61c70fd8/wiki/sources/source-一万字提示词-10个文件-给你的ai造一个-数字灵魂.md
 - Applied ingest bundle 20260419T123816611810-一万字提示词-10个文件-给你的-61c70fd8
+## [2026-04-19] maintenance | refresh source-一万字提示词-10个文件-给你的ai造一个-数字灵魂
+
+- Replaced the weak `pdf-text` extraction with the current local `markitdown` extraction output in raw/domains/codex-native-memory-governance/ingest/20260419T123816611810-一万字提示词-10个文件-给你的-61c70fd8/extracted.md
+- Refreshed wiki/sources/source-一万字提示词-10个文件-给你的ai造一个-数字灵魂.md so its summary matches the current extracted evidence

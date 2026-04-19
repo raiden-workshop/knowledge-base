@@ -18,15 +18,15 @@
     "output/ingest-drafts/20260419T123816611810-一万字提示词-10个文件-给你的-61c70fd8/wiki/sources/source-一万字提示词-10个文件-给你的ai造一个-数字灵魂.md"
   ],
   "duplicate_matches": [],
-  "notes": [
-    "Extracted text is weak; keep this ingest in source-only review mode."
-  ],
-  "extraction_mode": "pdf-text",
-  "extraction_quality": "weak",
+  "notes": [],
+  "extraction_mode": "markitdown-local",
+  "extraction_quality": "strong",
   "created_at": "2026-04-19T12:38:16+08:00",
-  "updated_at": "2026-04-19T12:38:31+08:00",
+  "updated_at": "2026-04-19T14:11:58+08:00",
   "applied_at": "2026-04-19T12:38:31+08:00",
   "applied_pages": [
     "wiki/sources/source-一万字提示词-10个文件-给你的ai造一个-数字灵魂.md"
-  ]
+  ],
+  "extractor_name": "markitdown",
+  "extractor_version": "unknown"
 }

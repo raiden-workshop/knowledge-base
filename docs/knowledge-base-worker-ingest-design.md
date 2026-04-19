@@ -150,7 +150,6 @@ v1 支持以下输入类型：
 
 状态流转固定如下：
 
-- `pending`
 - `needs_browser_capture`
 - `blocked_duplicate`
 - `ready_for_review`

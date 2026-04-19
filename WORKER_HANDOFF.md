@@ -36,9 +36,9 @@
 
 ## Current State
 
-- Sources: `15`
+- Sources: `17`
 - Entities: `2`
-- Concepts: `4`
+- Concepts: `5`
 - Syntheses: `3`
 - Domains: `1`
 - Reports: `4`
@@ -46,7 +46,8 @@
 ## Next Safe Action
 
 - 日常查询或改动前先跑 `./kb maintain`
-- 若先处理外部本地文件，优先从 `./kb extract /absolute/path/to/file` 开始
-- 若要跑 PDF 等文件型离线提取，直接使用 `./kb extract /absolute/path/to/file`
+- 若要把外部本地文件正式收进知识库，优先直接使用 `./kb ingest /absolute/path/to/file`
+- 若只想单独验证提取质量，再使用 `./kb extract /absolute/path/to/file`
+- 文件型 `ingest` 会先自动走本地 `markitdown` 转成 Markdown，再生成 ingest bundle 与 source draft
 - `./kb` 会自动使用仓库内的 `output/runtime-markitdown` 本地运行环境；这不是全局自动化，而是仓库内的执行约定
 - `./kb-with-markitdown` 只是可选兼容层，不是必需步骤

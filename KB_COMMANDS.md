@@ -7,9 +7,9 @@ cd /Users/wz/project/knowledge-base
 ./kb <command> ...
 ```
 
-`./kb extract ...` 本身会自动优先使用仓库内的 `output/runtime-markitdown`，所以它是主入口。
+`./kb ingest ...` 是把资料正式收进知识库的主入口。
 
-`./kb ingest ...` 现在也会先自动走同一个本地 `markitdown` 运行环境，把原件转换成 Markdown，再生成 ingest bundle 和 source draft。
+`./kb extract ...` 复用同一个本地 `markitdown` 运行环境，但它只负责单独提取，不直接生成 canonical draft。
 
 如果你已经习惯了 `./kb-with-markitdown`，它只是一个可选的薄封装，不是必需步骤。
 
@@ -113,7 +113,7 @@ output/runtime-markitdown/bin/pip install 'markitdown[pdf]'
 ./kb extract /absolute/path/to/file.pdf --json
 ```
 
-如果你把文档交给 `knowledge-base` worker 并要求“整理到知识库”，它会优先复用这条本地离线提取链路；主入口就是 `./kb extract`，它会自动识别本地运行环境，不需要你手工记 `PATH`。`./kb-with-markitdown` 只是可选兼容层。前提仍然是该 worker 真的在 `/Users/wz/project/knowledge-base` 里执行，并且按这个仓库约定读取了 `README.md` / `KB_COMMANDS.md`。
+如果你把文档交给 `knowledge-base` worker 并要求“整理到知识库”，主入口应当是 `./kb ingest`。如果你只是想先单独验证本地 `markitdown` 的提取效果，再使用 `./kb extract`。两者都会自动识别本地运行环境，不需要你手工记 `PATH`。`./kb-with-markitdown` 只是可选兼容层。前提仍然是该 worker 真的在 `/Users/wz/project/knowledge-base` 里执行，并且按这个仓库约定读取了 `README.md` / `KB_COMMANDS.md`。
 
 ## `ingest`
 

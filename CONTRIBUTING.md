@@ -27,7 +27,7 @@
 - 当前 founding domain 是 `codex-native-memory-governance`
 - 可以扩到多 domain，但不要越过 domain registry
 - `industries / categories` 不能替代 `domain`
-- 报告、缓存、导出都不是正式知识
+- 报告、缓存、导出、`artifacts/` 都不是正式知识
 
 ## Review Expectations
 
@@ -40,4 +40,3 @@
 
 - 不要在这里接飞书机器人
 - 不要把旧 `codex-enhanced-system/knowledge-base` 当正式入口
-

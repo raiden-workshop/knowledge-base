@@ -131,7 +131,7 @@ worker 侧流程
 字段取值固定如下：
 
 - `relation_type`：`new | supplement | conflict | duplicate`
-- `review_status`：`pending | accepted | rejected | blocked_duplicate | needs_browser_capture | ready_for_review`
+- `review_status`：`accepted | rejected | blocked_duplicate | needs_browser_capture | ready_for_review`
 
 draft bundle 契约固定如下：
 
@@ -188,13 +188,12 @@ Phase D：文档与人工流程对齐
 
 输入类型：
 
-- URL 正常正文
+- URL 正常正文，经本地 `markitdown` 提取后可直接进入 review
 - URL 需要浏览器回退
 - TXT / Markdown
-- DOCX
-- PDF 含文本层
-- PDF 无文本层但 OCR 可提取
-- 图片 OCR
+- DOCX / ODT
+- PDF，经本地 `markitdown` 提取
+- 图片，经本地 `markitdown` 提取但不启用 OCR 增强
 
 关系类型：
 
@@ -205,8 +204,7 @@ Phase D：文档与人工流程对齐
 
 review 行为：
 
-- pending 到 ready_for_review
-- blocked_duplicate 不允许 apply
+- `needs_browser_capture` 与 `blocked_duplicate` 不允许直接 apply
 - reject 不修改 `wiki/`
 - apply 成功后 `wiki/index.md` 与 `wiki/log.md` 正确更新
 
@@ -228,7 +226,7 @@ review 行为：
 主要风险如下。
 
 - URL 内容质量差异大，HTTP 抓取结果不稳定
-- OCR 质量可能不足，导致错误派生
+- 本地 `markitdown` 对扫描件、图片或结构复杂文档可能只产出弱文本
 - supplement 与 conflict 的判断可能被过度自动化
 - apply 若非原子，容易把 draft 和 canonical 弄混
 
@@ -251,4 +249,4 @@ review 行为：
 - `kb query` 与 `kb maintain` 的边界和治理逻辑没有被破坏
 - 用户可以在当前对话中只用口语触发完整收录链路
 
-在上述条件完成之前，不更新现有 README、`KB_COMMANDS.md` 或其他“已可用能力”说明。
+上述条件完成后，README、`KB_COMMANDS.md`、`WORKER_HANDOFF.md` 与相关设计文档必须继续与当前实现保持同步。
