@@ -1,0 +1,35 @@
+{
+  "ingest_id": "20260427T105529703227-https-www-xiaoho-78d90c7c",
+  "target_type": "url",
+  "domain": "codex-native-memory-governance",
+  "source_title": "Codex 的自我进化：用 Automations 反思并改进 Skills",
+  "source_locator": "https://www.xiaohongshu.com/explore/69df989a000000002103b986?app_platform=ios&app_version=9.25&share_from_user_hidden=true&xsec_source=app_share&type=normal&xsec_token=CBbvVyDcVQuf3fI50BmRRS2dh7eD1GgLQoaUTAn16Zdw8=&author_share=1&xhsshare=WeixinSession&shareRedId=N0g7NUhIPU43Pzs7OTwwNjY0QDc0NUhK&apptime=1776285468&share_id=0e8e076777db486eba838d33b350345a",
+  "content_hash": "78d90c7c296dd05b4278d1c6e5c5105b0c470b7d38fd98603dad81667255765e",
+  "duplicate_status": "none",
+  "relation_type": "new",
+  "related_pages": [],
+  "review_status": "accepted",
+  "allow_duplicate": false,
+  "content_type": "text/html; charset=utf-8",
+  "original_file": "raw/domains/codex-native-memory-governance/ingest/20260427T105529703227-https-www-xiaoho-78d90c7c/69df989a000000002103b986.html",
+  "extracted_file": "raw/domains/codex-native-memory-governance/ingest/20260427T105529703227-https-www-xiaoho-78d90c7c/extracted.md",
+  "draft_bundle": "output/ingest-drafts/20260427T105529703227-https-www-xiaoho-78d90c7c",
+  "draft_pages": [
+    "output/ingest-drafts/20260427T105529703227-https-www-xiaoho-78d90c7c/wiki/sources/source-codex-self-evolution-automation-skills.md"
+  ],
+  "duplicate_matches": [],
+  "notes": [],
+  "extraction_mode": "markitdown-local",
+  "extractor_name": "markitdown",
+  "extractor_version": "unknown",
+  "ocr_applied": false,
+  "ocr_engine": null,
+  "ocr_languages": null,
+  "extraction_quality": "strong",
+  "created_at": "2026-04-27T10:55:28+08:00",
+  "updated_at": "2026-04-27T10:58:27+08:00",
+  "applied_at": "2026-04-27T10:58:27+08:00",
+  "applied_pages": [
+    "wiki/sources/source-codex-self-evolution-automation-skills.md"
+  ]
+}

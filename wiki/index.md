@@ -3,7 +3,7 @@ title: "Wiki Index"
 type: guide
 status: active
 created_at: 2026-04-09
-updated_at: 2026-04-19
+updated_at: 2026-04-29
 source_refs: []
 related:
   - domains/domain-codex-native-memory-governance
@@ -68,6 +68,16 @@ related:
 - [source-几乎涵盖所有事物的法典](./sources/source-几乎涵盖所有事物的法典.md): Auto-added source page for "几乎涵盖所有事物的法典"
 
 - [source-一万字提示词-10个文件-给你的ai造一个-数字灵魂](./sources/source-一万字提示词-10个文件-给你的ai造一个-数字灵魂.md): Auto-added source page for "一万字提示词+10个文件，给你的AI造一个“数字灵魂”"
+
+- [source-codex-self-evolution-automation-skills](./sources/source-codex-self-evolution-automation-skills.md): Auto-added source page for "Codex 的自我进化：用 Automations 反思并改进 Skills"
+
+- [source-lightpanda-browser-project-summary](./sources/source-lightpanda-browser-project-summary.md): Project-summary-only reference for Lightpanda, a Zig headless browser for AI-agent browsing and automation
+
+- [source-codex-image2-ui-production-pipeline](./sources/source-codex-image2-ui-production-pipeline.md): Auto-added source page for "Codex + GPT Image-2 UI production pipeline"
+
+- [source-gpt-image-2-0-4144e88e](./sources/source-gpt-image-2-0-4144e88e.md): Auto-added source page for "source-gpt-image-2-0-4144e88e"
+
+- [source-pdf-skill-100-claude-code-f65cd670](./sources/source-pdf-skill-100-claude-code-f65cd670.md): Auto-added source page for "我做了一个精美 PDF 排版 Skill，以生成 100+ 页 Claude Code 系统报告为例"
 ## Entities
 
 - [entity-codex-memory-kit](./entities/entity-codex-memory-kit.md): The repository as a memory-governance layer, not a replacement runtime

@@ -3,7 +3,7 @@ title: "Knowledge Base Log"
 type: report
 status: active
 created_at: 2026-04-09
-updated_at: 2026-04-19
+updated_at: 2026-04-29
 source_refs: []
 related:
   - index
@@ -130,3 +130,21 @@ related:
 
 - Replaced the weak `pdf-text` extraction with the current local `markitdown` extraction output in raw/domains/codex-native-memory-governance/ingest/20260419T123816611810-一万字提示词-10个文件-给你的-61c70fd8/extracted.md
 - Refreshed wiki/sources/source-一万字提示词-10个文件-给你的ai造一个-数字灵魂.md so its summary matches the current extracted evidence
+## [2026-04-27] ingest | accept source-codex-self-evolution-automation-skills
+
+- Accepted output/ingest-drafts/20260427T105529703227-https-www-xiaoho-78d90c7c/wiki/sources/source-codex-self-evolution-automation-skills.md
+- Applied ingest bundle 20260427T105529703227-https-www-xiaoho-78d90c7c
+## [2026-04-27] ingest | add source-lightpanda-browser-project-summary
+
+- Added wiki/sources/source-lightpanda-browser-project-summary.md as a project-summary-only external tool reference
+- Preserved raw summary at raw/domains/codex-native-memory-governance/external-tools/lightpanda-browser-project-summary-2026-04-27.md
+- Intentionally omitted deployment, install, build, and local setup instructions
+## [2026-04-29] ingest | add source-codex-image2-ui-production-pipeline
+
+- Browser-captured WeChat article after HTTP ingest returned an environment anomaly page; added summary source and preserved failed ingest evidence.
+## [2026-04-29] ingest | add source-gpt-image-2-0-4144e88e
+
+- Added wiki/sources/source-gpt-image-2-0-4144e88e.md from Playwright browser capture for https://mp.weixin.qq.com/s/EylnGzuDkdhkbEoCUpUpbA
+## [2026-04-29] ingest | add source-pdf-skill-100-claude-code-f65cd670
+
+- Added wiki/sources/source-pdf-skill-100-claude-code-f65cd670.md from Playwright browser capture for https://mp.weixin.qq.com/s/7ZhEyJNmwiHaKFrNKZaAHw
